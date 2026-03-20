@@ -899,9 +899,10 @@ class SteamStatusMonitorV2(Star):
         return Nodes(nodes)
 
     def build_fallback_chain(self, events):
-        chain = [Plain(f"Steam 状态更新（共 {len(events)} 条）")]
+        chain = []
         for event in events:
-            chain.append(Plain(f"\n\n{event['summary_text']}"))
+            prefix = "\n\n" if chain else ""
+            chain.append(Plain(f"{prefix}{event['summary_text']}"))
             image_path = event.get("image_path")
             if image_path and os.path.exists(image_path):
                 chain.append(Image.fromFileSystem(image_path))
