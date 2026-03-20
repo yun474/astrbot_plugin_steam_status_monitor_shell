@@ -1,7 +1,14 @@
 {
   "steam_api_key": "",
-  "steam_ids": [
-  ],
-  "poll_interval_sec": 60,
-  "retry_times": 3
+  "sgdb_api_key": "",
+  "fixed_poll_interval": 0,
+  "retry_times": 3,
+  "detailed_poll_log": true,
+  "steam_group_mapping": [],
+  "enable_failure_blacklist": false,
+  "card_update_interval_sec": 86400,
+  "notification_batch_window_sec": 45,
+  "notification_batch_max_events": 12,
+  "notification_delivery_mode": "auto",
+  "notification_merge_achievements": true
 }

@@ -1,7 +1,16 @@
+import os
 import time
 import io
 from typing import Optional
 from .steam_list_render import render_steam_list_image
+
+
+PERSONA_STATE_TO_STATUS = {
+    1: "online",
+    2: "busy",
+    3: "away",
+    4: "snooze",
+}
 
 async def handle_steam_list(self, event, *, font_path: Optional[str] = None, **_kwargs):
     '''列出所有玩家当前状态（图片美化版，分群支持）'''
@@ -74,10 +83,11 @@ async def handle_steam_list(self, event, *, font_path: Optional[str] = None, **_
                 'lastlogoff': lastlogoff
             })
         elif personastate and int(personastate) > 0:
+            status_name = PERSONA_STATE_TO_STATUS.get(int(personastate), "online")
             user_list.append({
                 'sid': sid,
                 'name': name,
-                'status': 'online',
+                'status': status_name,
                 'avatar_url': avatar_url,
                 'game': '',
                 'gameid': '',
@@ -115,6 +125,10 @@ async def handle_steam_list(self, event, *, font_path: Optional[str] = None, **_
             with tempfile.NamedTemporaryFile(delete=False, suffix=".png") as tmp:
                 tmp.write(buf.read())
                 tmp_path = tmp.name
-            yield event.image_result(tmp_path)
+            try:
+                yield event.image_result(tmp_path)
+            finally:
+                if os.path.exists(tmp_path):
+                    os.remove(tmp_path)
     else:
         yield event.plain_result("渲染图片失败")

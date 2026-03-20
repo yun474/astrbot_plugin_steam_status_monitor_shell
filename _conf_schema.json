@@ -45,5 +45,29 @@
     "type": "int",
     "hint": "定时更新绑定的QQ群名片，默认86400秒（24小时）",
     "default": 86400
+  },
+  "notification_batch_window_sec": {
+    "description": "通知批处理窗口（秒）",
+    "type": "int",
+    "hint": "窗口内事件会合并后发送，超出范围会按30-60秒夹紧",
+    "default": 45
+  },
+  "notification_batch_max_events": {
+    "description": "通知批处理最大事件数",
+    "type": "int",
+    "hint": "窗口内达到该数量会立即发送",
+    "default": 12
+  },
+  "notification_delivery_mode": {
+    "description": "通知投递模式",
+    "type": "string",
+    "hint": "仅支持 auto、forward、plain；非法值会回退到 auto",
+    "default": "auto"
+  },
+  "notification_merge_achievements": {
+    "description": "成就通知合并开关",
+    "type": "bool",
+    "hint": "开启后会合并同窗口内的成就事件",
+    "default": true
   }
 }

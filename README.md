@@ -22,8 +22,8 @@
 | 超过48小时       | 30分钟   |
 
 ## 快速上手
-1. 在AstrBot网页后台的配置中配置 Steam_Web_API_Key：[点击获取](https://steamcommunity.com/dev/apikey)
-2. 在AstrBot网页后台的配置中配置 SGDB_API_KEY（用于获取封面图，可选）：[点击获取](https://www.steamgriddb.com/profile/preferences/api)
+1. 在AstrBot网页后台配置 `steam_api_key`：[点击获取](https://steamcommunity.com/dev/apikey)
+2. 在AstrBot网页后台配置 `sgdb_api_key`（用于获取封面图，可选）：[点击获取](https://www.steamgriddb.com/profile/preferences/api)
 3. （可选）在AstrBot网页后台配置中添加 `steam_group_mapping` 配置项，格式为 `SteamID|群号`，例如：`76561198888888888|123456789`
 4. 在需要进行提醒的群聊输入指令：
    `/steam addid [Steam64位ID]`  （如：/steam addid 7656119xxxxxxxxxx）
@@ -54,7 +54,7 @@
 - `/steam check` 立即手动检测本群并推送变更
 - `/steam alllist` 列出所有群聊分组及玩家状态
 - `/steam config` 查看当前插件配置
-- `/steam set [参数] [值]` 设置配置参数（如 `/steam set poll_interval_sec 30`）
+- `/steam set [参数] [值]` 设置配置参数（如 `/steam set fixed_poll_interval 600`）
 - `/steam addid [SteamID] [QQ号]` 添加监控，可绑定QQ号以显示群名片（如 `/steam addid 76561198xxxxxxxxx 123456789`）
 - `/steam bind [SteamID] [QQ号]` 为已添加的SteamID绑定或更新QQ号
 - `/steam delid [SteamID]` 从本群监控列表删除SteamID
@@ -65,21 +65,36 @@
 - `/steam achievement_off` 关闭本群Steam成就推送
 - `/steam test_achievement_render [steamid] [gameid] [数量]` 测试成就图片渲染
 - `/steam test_game_start_render [steamid] [gameid]` 测试开始游戏图片渲染
+- `/steam test_game_end_render [steamid] [gameid] [duration_min] [end_time] [tip_text]` 测试结束游戏图片渲染
 - `/steam清除缓存` 清除所有头像、封面图等图片缓存
 - `/steam help` 显示所有指令帮助
 
 ## 依赖
 - Python 3.7+
 - httpx
+- aiohttp
+- requests
+- apscheduler
 - Pillow
 - AstrBot 框架
 
 ### 依赖安装方法
 如果显示缺少依赖，你可以尝试下载以下工具来进行修复
-pip install httpx pillow
+pip install httpx apscheduler aiohttp requests pillow
 
-### 新增配置项
-- `card_update_interval_sec`: 群名片自动更新间隔，默认 86400 秒（24小时）。
+### 配置项说明
+- `steam_api_key`: Steam Web API Key。
+- `sgdb_api_key`: SteamGridDB API Key（可选）。
+- `fixed_poll_interval`: 固定轮询间隔（秒），`0` 表示启用智能轮询。
+- `retry_times`: Steam API 请求重试次数。
+- `detailed_poll_log`: 详细轮询日志开关。
+- `steam_group_mapping`: SteamID 与会话映射列表。
+- `enable_failure_blacklist`: 成就失败加入黑名单开关。
+- `card_update_interval_sec`: 群名片自动更新间隔（秒），默认 `86400`。
+- `notification_batch_window_sec`: 通知批处理窗口（秒），默认 `45`。
+- `notification_batch_max_events`: 通知批处理最大事件数，默认 `12`。
+- `notification_delivery_mode`: 通知投递模式，支持 `auto`/`forward`/`plain`。
+- `notification_merge_achievements`: 成就通知合并开关，默认开启。
 
 可以添加QQ：1912584909 来反馈功能和建议 闲聊也欢迎喵~
 

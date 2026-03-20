@@ -87,12 +87,8 @@ class AchievementMonitor:
                                     ach["apiname"] for ach in achievements 
                                     if ach.get("achieved", 0) == 1
                                 }
-                                # 检查是否有描述字段且不全为空
-                                has_desc = any(ach.get("description") for ach in achievements)
-                                if has_desc:
-                                    all_failed = False
-                                    return unlocked
-                                # 否则继续尝试下一个语言
+                                all_failed = False
+                                return unlocked
                         elif response.status_code == 401:
                             print(f"无权限获取玩家 {steamid} 的游戏 {appid} 成就数据 (隐私设置)")
                             return None
@@ -215,7 +211,8 @@ class AchievementMonitor:
             except Exception as e:
                 print(f"获取成就详细信息异常: {e}")
         # 获取成功后写入缓存
-        self.details_cache[cache_key] = details
+        if details:
+            self.details_cache[cache_key] = details
         return details
     
     async def check_new_achievements(self, api_key: str, group_id: str, steamid: str, appid: int, player_name: str, game_name: str) -> Set[str]:
@@ -323,7 +320,12 @@ class AchievementMonitor:
         if unlocked_set is None:
             unlocked_set = set()
             if steamid is not None and appid is not None:
-                unlocked_set = await self.get_player_achievements(os.environ.get('STEAM_API_KEY', ''), steamid, appid) or set()
+                unlocked_set = await self.get_player_achievements(
+                    os.environ.get('STEAM_API_KEY', ''),
+                    "",
+                    steamid,
+                    appid
+                ) or set()
         unlocked_achievements = len(unlocked_set)
         total_achievements = len(achievement_details)
         progress_percent = int(unlocked_achievements / total_achievements * 100) if total_achievements else 0

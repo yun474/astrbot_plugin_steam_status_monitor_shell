@@ -12,7 +12,7 @@ COVER_W, COVER_H = 80, 120
 IMG_W, IMG_H = 512, 192  # 16:6，画布高度减少三分之一
 
 
-def get_avatar_path(data_dir, steamid, url, force_update=False):
+async def get_avatar_path(data_dir, steamid, url, force_update=False):
     avatar_dir = os.path.join(data_dir, "avatars")
     os.makedirs(avatar_dir, exist_ok=True)
     path = os.path.join(avatar_dir, f"{steamid}.jpg")
@@ -20,12 +20,15 @@ def get_avatar_path(data_dir, steamid, url, force_update=False):
     if os.path.exists(path) and not force_update:
         if time.time() - os.path.getmtime(path) < refresh_interval:
             return path
+    if not url:
+        return path if os.path.exists(path) else None
     try:
-        resp = httpx.get(url, timeout=10)
-        if resp.status_code == 200:
-            with open(path, "wb") as f:
-                f.write(resp.content)
-            return path
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.get(url)
+            if resp.status_code == 200:
+                with open(path, "wb") as f:
+                    f.write(resp.content)
+                return path
     except Exception:
         pass
     return path if os.path.exists(path) else None
@@ -114,8 +117,6 @@ async def get_sgdb_vertical_cover(game_name, sgdb_api_key=None, sgdb_game_name=N
             return None
 
 async def get_cover_path(data_dir, gameid, game_name, force_update=False, sgdb_api_key=None, sgdb_game_name=None, appid=None):
-    from PIL import Image as PILImage
-    import httpx
     cover_dir = os.path.join(data_dir, "covers_v")
     os.makedirs(cover_dir, exist_ok=True)
     path = os.path.join(cover_dir, f"{gameid}.jpg")
@@ -126,11 +127,12 @@ async def get_cover_path(data_dir, gameid, game_name, force_update=False, sgdb_a
     url = await get_sgdb_vertical_cover(game_name, sgdb_api_key, sgdb_game_name=sgdb_game_name, appid=appid)
     if url:
         try:
-            resp = httpx.get(url, timeout=10)
-            if resp.status_code == 200:
-                with open(path, "wb") as f:
-                    f.write(resp.content)
-                return path
+            async with httpx.AsyncClient(timeout=10) as client:
+                resp = await client.get(url)
+                if resp.status_code == 200:
+                    with open(path, "wb") as f:
+                        f.write(resp.content)
+                    return path
         except Exception as e:
             print(f"[get_cover_path] SGDB下载异常: {e} url={url}")
     print(f"[get_cover_path] SGDB未收录或下载失败: {gameid} {game_name}")
@@ -365,9 +367,6 @@ def render_game_start_image(player_name, avatar_path, game_name, cover_path, pla
             (text_x + 8, y_time),
             playtime_str, font=font_small, fill=(120,180,255,255)
         )
-        print(f"[render_game_start_image] 渲染游戏时长: {playtime_str}")
-    else:
-        print("[render_game_start_image] 未获取到游戏时长，playtime_hours=None")
 
     # 在线人数渲染（放在最后，确保不会被玩家名遮挡）
     if online_text:
@@ -376,8 +375,7 @@ def render_game_start_image(player_name, avatar_path, game_name, cover_path, pla
     return img.convert("RGB")
 
 async def render_game_start(data_dir, steamid, player_name, avatar_url, gameid, game_name, api_key=None, superpower=None, online_count=None, sgdb_api_key=None, font_path=None, sgdb_game_name=None, appid=None):
-    print(f"[render_game_start] superpower参数: {superpower}")
-    avatar_path = get_avatar_path(data_dir, steamid, avatar_url)
+    avatar_path = await get_avatar_path(data_dir, steamid, avatar_url)
     cover_path = await get_cover_path(data_dir, gameid, game_name, sgdb_api_key=sgdb_api_key, sgdb_game_name=sgdb_game_name, appid=appid)
     playtime_hours = None
     if api_key:

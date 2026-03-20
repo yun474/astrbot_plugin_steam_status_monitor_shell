@@ -4,7 +4,7 @@ from astrbot.api.star import Star, register, Context
 from astrbot.api import logger
 from astrbot.api.event import filter, AstrMessageEvent
 from astrbot.api.event import MessageChain
-from astrbot.api.message_components import Plain, Image  # 确保已导入 Image
+from astrbot.api.message_components import Plain, Image, Node, Nodes
 import json
 import time
 import httpx
@@ -17,6 +17,13 @@ import re
 from .achievement_monitor import AchievementMonitor
 from .game_start_render import render_game_start  # 新增导入
 from .game_end_render import render_game_end  # 新增导入
+from .network_flap_handler import handle_recent_reconnect
+from .notification_batcher import (
+    NotificationBufferStore,
+    build_notification_event,
+    fold_notification_events,
+    should_use_forward_delivery,
+)
 from PIL import Image as PILImage
 import io
 import requests  # 新增导入
@@ -36,6 +43,21 @@ class SteamStatusMonitorV2(Star):
     def _get_group_data_path(self, group_id, key):
         """获取分群数据文件路径"""
         return os.path.join(self.data_dir, f"group_{group_id}_{key}.json")
+
+    def _get_int_config(self, key, default):
+        value = self.config.get(key, default)
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            logger.warning(f"配置 {key}={value!r} 无效，回退到默认值 {default}")
+            return default
+
+    def _get_choice_config(self, key, default, choices):
+        value = str(self.config.get(key, default)).strip().lower()
+        if value in choices:
+            return value
+        logger.warning(f"配置 {key}={value!r} 无效，回退到默认值 {default}")
+        return default
 
     def _load_persistent_data(self):
         # 分群加载各群的状态数据
@@ -64,11 +86,28 @@ class SteamStatusMonitorV2(Star):
             except Exception as e:
                 logger.warning(f"加载 group_monitor_enabled 失败: {e} (group_id={group_id})")
 
+            # 加载成就推送开关状态
+            try:
+                path = self._get_group_data_path(group_id, "achievement_enabled")
+                if os.path.exists(path):
+                    with open(path, "r", encoding="utf-8") as f:
+                        self.group_achievement_enabled[group_id] = json.load(f)
+            except Exception as e:
+                logger.warning(f"加载 group_achievement_enabled 失败: {e} (group_id={group_id})")
+
             try:
                 path = self._get_group_data_path(group_id, "start_play_times")
                 if os.path.exists(path):
                     with open(path, "r", encoding="utf-8") as f:
-                        self.group_start_play_times[group_id] = json.load(f)
+                        raw_start_play_times = json.load(f)
+                        normalized_start_play_times = {}
+                        if isinstance(raw_start_play_times, dict):
+                            for sid, sid_start_times in raw_start_play_times.items():
+                                if isinstance(sid_start_times, dict):
+                                    normalized_start_play_times[sid] = sid_start_times
+                                else:
+                                    normalized_start_play_times[sid] = {}
+                        self.group_start_play_times[group_id] = normalized_start_play_times
             except Exception as e:
                 logger.warning(f"加载 group_start_play_times 失败: {e} (group_id={group_id})")
             try:
@@ -131,6 +170,14 @@ class SteamStatusMonitorV2(Star):
                     json.dump(self.group_monitor_enabled.get(group_id, True), f, ensure_ascii=False)
             except Exception as e:
                 logger.warning(f"保存 group_monitor_enabled 失败: {e} (group_id={group_id})")
+
+            # 保存成就推送开关状态
+            try:
+                path = self._get_group_data_path(group_id, "achievement_enabled")
+                with open(path, "w", encoding="utf-8") as f:
+                    json.dump(self.group_achievement_enabled.get(group_id, True), f, ensure_ascii=False)
+            except Exception as e:
+                logger.warning(f"保存 group_achievement_enabled 失败: {e} (group_id={group_id})")
 
             try:
                 path = self._get_group_data_path(group_id, "start_play_times")
@@ -479,6 +526,27 @@ class SteamStatusMonitorV2(Star):
         self.config.setdefault('enable_failure_blacklist', False)
         self.enable_failure_blacklist = self.config.get('enable_failure_blacklist', False)
         self.card_update_interval_sec = self.config.get('card_update_interval_sec', 86400)
+        self.notification_batch_window_sec = min(
+            60, max(30, self._get_int_config('notification_batch_window_sec', 45))
+        )
+        self.notification_batch_max_events = max(
+            1, self._get_int_config('notification_batch_max_events', 12)
+        )
+        self.notification_delivery_mode = self._get_choice_config(
+            'notification_delivery_mode',
+            'auto',
+            {'auto', 'forward', 'plain'},
+        )
+        self.notification_merge_achievements = self.config.get(
+            'notification_merge_achievements', True
+        )
+        self.notification_buffer_store = NotificationBufferStore(
+            max_events=self.notification_batch_max_events
+        )
+        self.group_notification_buffers = self.notification_buffer_store.buffers
+        self.group_notification_flush_tasks = {}
+        self.group_notification_flush_states = {}
+        self.group_notification_window_started_at = {}
         
         # 数据持久化目录
         self.data_dir = str(astrbot.core.star.StarTools.get_data_dir("steam_status_monitor"))
@@ -546,6 +614,13 @@ class SteamStatusMonitorV2(Star):
         if all_logs:
             logger.info("====== Steam状态监控初始化日志 ======\n" + "\n".join(all_logs) + "\n=====================================================")
 
+    async def _safe_check_status_change(self, group_id, sid):
+        try:
+            return await self.check_status_change(group_id, single_sid=sid)
+        except Exception as e:
+            logger.error(f"轮询检测异常: group_id={group_id} sid={sid} error={e}")
+            return None
+
     async def global_poll_and_log_loop(self):
         '''全局定时并发查询所有群Steam状态，按动态间隔判断是否需要查询，40秒统一输出日志'''
         while True:
@@ -568,7 +643,7 @@ class SteamStatusMonitorV2(Star):
                     continue
                 async def query_one_group(gid, sids):
                     round_msg_lines = []
-                    tasks = [self.check_status_change(gid, single_sid=sid) for sid in sids]
+                    tasks = [self._safe_check_status_change(gid, sid) for sid in sids]
                     if tasks:
                         results = await asyncio.gather(*tasks)
                         for msg in results:
@@ -591,18 +666,373 @@ class SteamStatusMonitorV2(Star):
                     logger.info("周期轮询成功")
                 self._last_round_logs.clear()
 
+    async def _cancel_asyncio_tasks(self, tasks):
+        alive = [task for task in tasks if hasattr(task, "done") and not task.done()]
+        for task in alive:
+            task.cancel()
+        if alive:
+            await asyncio.gather(*alive, return_exceptions=True)
+
+    def _collect_pending_quit_tasks(self):
+        pending_quit_tasks = getattr(self, "_pending_quit_tasks", {})
+        if not isinstance(pending_quit_tasks, dict):
+            return []
+        tasks = []
+        for level1 in pending_quit_tasks.values():
+            if not isinstance(level1, dict):
+                continue
+            for level2 in level1.values():
+                if isinstance(level2, dict):
+                    for task in level2.values():
+                        if hasattr(task, "cancel"):
+                            tasks.append(task)
+                    continue
+                if hasattr(level2, "cancel"):
+                    tasks.append(level2)
+        return tasks
+
     async def terminate(self):
         '''插件被卸载/停用时自动保存持久化数据'''
-        # 停止后台任务
-        if hasattr(self, '_poll_task'): self._poll_task.cancel()
-        if hasattr(self, '_card_task'): self._card_task.cancel()
-        
+        core_tasks = [
+            getattr(self, "_poll_task", None),
+            getattr(self, "_card_task", None),
+            getattr(self, "_init_task", None),
+        ]
+        await self._cancel_asyncio_tasks([task for task in core_tasks if task is not None])
+
+        waiting_tasks = []
+        sending_tasks = []
+        for group_id, task in list(self.group_notification_flush_tasks.items()):
+            if task.done():
+                continue
+            if self.group_notification_flush_states.get(group_id) == "sending":
+                sending_tasks.append(task)
+                continue
+            task.cancel()
+            waiting_tasks.append(task)
+        if waiting_tasks:
+            await asyncio.gather(*waiting_tasks, return_exceptions=True)
+        if sending_tasks:
+            await asyncio.gather(*sending_tasks, return_exceptions=True)
+
+        pending_quit_tasks = self._collect_pending_quit_tasks()
+        for task in pending_quit_tasks:
+            task.cancel()
+        pending_quit_asyncio = [task for task in pending_quit_tasks if hasattr(task, "done")]
+        if pending_quit_asyncio:
+            await asyncio.gather(*pending_quit_asyncio, return_exceptions=True)
+        self._pending_quit_tasks = {}
+
+        for group_id in list(self.group_notification_buffers.keys()):
+            if not self.group_notification_buffers.get(group_id):
+                continue
+            try:
+                await self._flush_group_notifications_now(group_id)
+            except Exception as e:
+                logger.error(f"关闭前发送待推送通知失败: {e}")
+
         self._save_persistent_data()
         # 停止所有成就定时任务
         for task in self.achievement_poll_tasks.values():
             task.cancel()
         self.achievement_poll_tasks.clear()
         self.achievement_snapshots.clear()
+
+    def _get_notify_session(self, group_id):
+        return getattr(self, 'notify_sessions', {}).get(group_id)
+
+    def _create_group_notification_event(
+        self,
+        *,
+        event_type,
+        group_id,
+        steamid,
+        player_name,
+        gameid,
+        game_name,
+        summary_text,
+        image_path=None,
+        achievement_names=None,
+    ):
+        return build_notification_event(
+            event_type=event_type,
+            group_id=str(group_id),
+            steamid=str(steamid),
+            player_name=player_name,
+            gameid=str(gameid) if gameid else "",
+            game_name=game_name,
+            summary_text=summary_text,
+            image_path=image_path,
+            achievement_names=achievement_names or [],
+            occurred_at=int(time.time()),
+        )
+
+    async def _enqueue_group_notification(self, event, flush_immediately=False):
+        group_id = event["group_id"]
+        if flush_immediately:
+            await self._flush_group_notifications_now(group_id, [event])
+            return
+        enqueue_result = self.notification_buffer_store.enqueue(event)
+        if enqueue_result["start_window"]:
+            self.group_notification_window_started_at[group_id] = time.time()
+            task = asyncio.create_task(self._flush_group_notifications_later(group_id))
+            self.group_notification_flush_tasks[group_id] = task
+            self.group_notification_flush_states[group_id] = "waiting"
+        if enqueue_result["flush_now"]:
+            await self._flush_group_notifications_now(group_id)
+
+    async def _flush_group_notifications_later(self, group_id):
+        try:
+            await asyncio.sleep(self.notification_batch_window_sec)
+            self.group_notification_flush_states[group_id] = "sending"
+            await self._flush_group_notifications(group_id)
+        except asyncio.CancelledError:
+            return
+        finally:
+            current_task = asyncio.current_task()
+            if self.group_notification_flush_tasks.get(group_id) is current_task:
+                self.group_notification_flush_tasks.pop(group_id, None)
+                self.group_notification_flush_states.pop(group_id, None)
+                self.group_notification_window_started_at.pop(group_id, None)
+
+    async def _flush_group_notifications(self, group_id):
+        events = self.notification_buffer_store.pop_group(group_id)
+        if not events:
+            return
+        await self._send_group_notification_events(group_id, events)
+
+    async def _cancel_waiting_group_notification_task(self, group_id):
+        flush_task = self.group_notification_flush_tasks.get(group_id)
+        if not flush_task or flush_task.done():
+            return
+        if self.group_notification_flush_states.get(group_id) != "waiting":
+            return
+        flush_task.cancel()
+        await asyncio.gather(flush_task, return_exceptions=True)
+
+    async def _flush_group_notifications_now(self, group_id, extra_events=None):
+        await self._cancel_waiting_group_notification_task(group_id)
+        events = self.notification_buffer_store.pop_group(group_id)
+        self.group_notification_window_started_at.pop(group_id, None)
+        if extra_events:
+            events.extend(extra_events)
+        if not events:
+            return
+        await self._send_group_notification_events(group_id, events)
+
+    def _clone_notification_event(self, event):
+        copied = dict(event)
+        copied["achievement_names"] = list(copied.get("achievement_names") or [])
+        return copied
+
+    def _restore_failed_group_notifications(self, group_id, events):
+        group_id = str(group_id)
+        restored_events = [self._clone_notification_event(event) for event in events]
+        if not restored_events:
+            return
+        group_buffer = self.group_notification_buffers.setdefault(group_id, [])
+        group_buffer[0:0] = restored_events
+        if not hasattr(self, "group_notification_flush_tasks"):
+            self.group_notification_flush_tasks = {}
+        if not hasattr(self, "group_notification_flush_states"):
+            self.group_notification_flush_states = {}
+        if not hasattr(self, "group_notification_window_started_at"):
+            self.group_notification_window_started_at = {}
+        current_task = self.group_notification_flush_tasks.get(group_id)
+        is_waiting = self.group_notification_flush_states.get(group_id) == "waiting"
+        if current_task and not current_task.done() and is_waiting:
+            return
+        if not hasattr(self, "notification_batch_window_sec"):
+            return
+        retry_task = asyncio.create_task(self._flush_group_notifications_later(group_id))
+        self.group_notification_flush_tasks[group_id] = retry_task
+        self.group_notification_flush_states[group_id] = "waiting"
+        self.group_notification_window_started_at[group_id] = time.time()
+
+    async def _send_group_notification_events(self, group_id, events):
+        notify_session = self._get_notify_session(group_id)
+        if not notify_session:
+            logger.error(f"未设置推送会话，无法发送消息 group_id={group_id}")
+            self._cleanup_notification_images(events)
+            return
+        folded_events = fold_notification_events(
+            events,
+            merge_achievements=self.notification_merge_achievements,
+        )
+        delivery_succeeded = False
+        try:
+            try:
+                if should_use_forward_delivery(
+                    self.notification_delivery_mode, notify_session
+                ):
+                    await self.context.send_message(
+                        notify_session,
+                        MessageChain([self.build_forward_nodes(folded_events)]),
+                    )
+                else:
+                    await self.context.send_message(
+                        notify_session,
+                        self.build_fallback_chain(folded_events),
+                    )
+            except Exception as e:
+                logger.error(f"发送合并转发消息失败，回退普通聚合消息: {e}")
+                await self.context.send_message(
+                    notify_session,
+                    self.build_fallback_chain(folded_events),
+                )
+            delivery_succeeded = True
+        except Exception:
+            self._restore_failed_group_notifications(group_id, events)
+            raise
+        finally:
+            if delivery_succeeded:
+                self._cleanup_notification_images(events)
+
+    def build_forward_nodes(self, events):
+        nodes = []
+        for event in events:
+            content = [Plain(event["summary_text"])]
+            image_path = event.get("image_path")
+            if image_path and os.path.exists(image_path):
+                content.append(Image.fromFileSystem(image_path))
+            nodes.append(Node(uin="0", name="Steam 状态监控", content=content))
+        return Nodes(nodes)
+
+    def build_fallback_chain(self, events):
+        chain = [Plain(f"Steam 状态更新（共 {len(events)} 条）")]
+        for event in events:
+            chain.append(Plain(f"\n\n{event['summary_text']}"))
+            image_path = event.get("image_path")
+            if image_path and os.path.exists(image_path):
+                chain.append(Image.fromFileSystem(image_path))
+        return MessageChain(chain)
+
+    def _cleanup_notification_images(self, events):
+        image_paths = {
+            event.get("image_path")
+            for event in events
+            if event.get("image_path")
+        }
+        for image_path in image_paths:
+            try:
+                if os.path.exists(image_path):
+                    os.remove(image_path)
+            except OSError as e:
+                logger.warning(f"清理通知图片失败: {e} path={image_path}")
+
+    def _write_temp_image(self, img_bytes):
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".png") as tmp:
+            tmp.write(img_bytes)
+            return tmp.name
+
+    def _pick_render_name(self, preferred_name, fallback_name):
+        if preferred_name:
+            return preferred_name
+        if " (" in fallback_name and fallback_name.endswith(")"):
+            return fallback_name.rsplit(" (", 1)[0]
+        return fallback_name
+
+    def _build_achievement_summary_text(
+        self, player_name, game_name, achievements_to_notify, extra_count
+    ):
+        total_count = len(achievements_to_notify) + max(extra_count, 0)
+        preview = "、".join(achievements_to_notify[:5])
+        summary = (
+            f"🎉 {player_name} 在 {game_name} 中解锁了 {total_count} 个新成就"
+        )
+        if preview:
+            summary += f"：{preview}"
+        if extra_count > 0:
+            summary += f" 等另外 {extra_count} 个"
+        return summary
+
+    async def _render_achievement_notification_image(
+        self,
+        *,
+        group_id,
+        steamid,
+        player_name,
+        gameid,
+        game_name,
+        achievements_to_notify,
+        details,
+    ):
+        if not details:
+            return None
+        for detail in details.values():
+            detail["game_name"] = game_name
+        unlocked_set = await self.achievement_monitor.get_player_achievements(
+            self.API_KEY, group_id, steamid, gameid
+        )
+        if not unlocked_set:
+            key = (group_id, steamid, gameid)
+            unlocked_set = set(self.achievement_snapshots.get(key, []))
+        img_bytes = await self.achievement_monitor.render_achievement_image(
+            details,
+            set(achievements_to_notify),
+            player_name=player_name,
+            steamid=steamid,
+            appid=gameid,
+            unlocked_set=unlocked_set or set(),
+            font_path=self.get_font_path('NotoSansHans-Regular.otf'),
+        )
+        return self._write_temp_image(img_bytes)
+
+    async def _render_game_start_notification_image(
+        self, sid, current_gameid, zh_game_name, render_name, status
+    ):
+        avatar_url = status.get("avatarfull") or status.get("avatar")
+        zh_game_name, en_game_name = await self.get_game_names(
+            current_gameid, zh_game_name
+        )
+        img_bytes = await render_game_start(
+            self.data_dir,
+            sid,
+            render_name,
+            avatar_url,
+            current_gameid,
+            zh_game_name,
+            api_key=self.API_KEY,
+            superpower=self.get_today_superpower(sid),
+            sgdb_api_key=self.SGDB_API_KEY,
+            font_path=self.get_font_path('NotoSansHans-Regular.otf'),
+            sgdb_game_name=en_game_name,
+            online_count=await self.get_game_online_count(current_gameid),
+            appid=current_gameid,
+        )
+        return self._write_temp_image(img_bytes)
+
+    async def _render_game_end_notification_image(self, group_id, sid, gameid, info):
+        from datetime import datetime
+
+        end_time_str = datetime.fromtimestamp(info["quit_time"]).strftime("%Y-%m-%d %H:%M")
+        duration_h = info["duration_min"] / 60 if info["duration_min"] > 0 else 0
+        avatar_url = None
+        last_state = self.group_last_states.get(group_id, {}).get(sid)
+        if last_state:
+            avatar_url = last_state.get("avatarfull") or last_state.get("avatar")
+        if not avatar_url:
+            status_full = await self.fetch_player_status(sid)
+            if status_full:
+                avatar_url = status_full.get("avatarfull") or status_full.get("avatar")
+        zh_game_name, en_game_name = await self.get_game_names(gameid, info["game_name"])
+        render_name = self._pick_render_name(info.get("image_name"), info.get("name", ""))
+        img_bytes = await render_game_end(
+            self.data_dir,
+            sid,
+            render_name,
+            avatar_url,
+            gameid,
+            zh_game_name,
+            end_time_str,
+            info.get("tip_text") or "你已经和椅子合为一体，成为传说中的‘椅子精’了喵！",
+            duration_h,
+            sgdb_api_key=self.SGDB_API_KEY,
+            font_path=self.get_font_path('NotoSansHans-Regular.otf'),
+            sgdb_game_name=en_game_name,
+            appid=gameid,
+        )
+        return self._write_temp_image(img_bytes)
 
     def crop_image_auto(self, img_path_or_bytes, bg_color=(20,26,33), threshold=25):
         """
@@ -900,64 +1330,57 @@ class SteamStatusMonitorV2(Star):
             return
         achievements_to_notify = list(new_achievements)[:self.max_achievement_notifications]
         extra_count = len(new_achievements) - len(achievements_to_notify)
-        # 优先用缓存
         details = self.achievement_monitor.details_cache.get((group_id, gameid))
         if not details:
             try:
-                details = await self.achievement_monitor.get_achievement_details(group_id, gameid, lang="schinese", api_key=self.API_KEY, steamid=steamid)
+                details = await self.achievement_monitor.get_achievement_details(
+                    group_id,
+                    gameid,
+                    lang="schinese",
+                    api_key=self.API_KEY,
+                    steamid=steamid,
+                )
             except Exception as e:
                 details = None
                 logger.warning(f"获取成就详情失败: {e}")
-        # 在渲染前补充 game_name 字段，确保图片顶部能显示游戏名
-        if details and game_name:
-            for d in details.values():
-                d["game_name"] = game_name
-        font_path = self.get_font_path('NotoSansHans-Regular.otf')
+        image_path = None
         if details:
-            # 获取已解锁成就集合，API 失败时用快照兜底
-            unlocked_set = await self.achievement_monitor.get_player_achievements(self.API_KEY, group_id, steamid, gameid)
-            if not unlocked_set:
-                key = (group_id, steamid, gameid)
-                unlocked_set = set(self.achievement_snapshots.get(key, []))
-            if unlocked_set is None:
-                unlocked_set = set()
             try:
-                img_bytes = await self.achievement_monitor.render_achievement_image(details, set(achievements_to_notify), player_name=player_name, steamid=steamid, appid=gameid, unlocked_set=unlocked_set, font_path=font_path)
-                with tempfile.NamedTemporaryFile(delete=False, suffix=".png") as tmp:
-                    tmp.write(img_bytes)
-                    tmp_path = tmp.name
-                await self.context.send_message(self.notify_sessions[group_id], MessageChain([Image.fromFileSystem(tmp_path)]))
-                return
+                image_path = await self._render_achievement_notification_image(
+                    group_id=group_id,
+                    steamid=steamid,
+                    player_name=player_name,
+                    gameid=gameid,
+                    game_name=game_name,
+                    achievements_to_notify=achievements_to_notify,
+                    details=details,
+                )
             except Exception as e:
-                import traceback
                 logger.error(f"成就图片渲染失败: {e}\n{traceback.format_exc()}")
-        # 回退文本
-        message = f"🎉 {player_name} 在 {game_name} 中解锁了新成就!\n"
-        for achievement in achievements_to_notify:
-            message += f"• {achievement}\n"
-        if extra_count > 0:
-            message += f"...以及另外 {extra_count} 个成就"
-        try:
-            await self.context.send_message(self.notify_sessions[group_id], MessageChain([Plain(message)]))
-        except Exception as e:
-            logger.error(f"发送成就通知失败: {e}")
+        event = self._create_group_notification_event(
+            event_type="achievement",
+            group_id=group_id,
+            steamid=steamid,
+            player_name=player_name,
+            gameid=gameid,
+            game_name=game_name,
+            summary_text=self._build_achievement_summary_text(
+                player_name,
+                game_name,
+                achievements_to_notify,
+                extra_count,
+            ),
+            image_path=image_path,
+            achievement_names=achievements_to_notify,
+        )
+        event["achievement_total"] = len(achievements_to_notify) + max(extra_count, 0)
+        await self._enqueue_group_notification(event)
 
     @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("steam on")
     async def steam_on(self, event: AstrMessageEvent):
         '''手动启动Steam状态监控轮询（分群）'''
         group_id = str(event.get_group_id()) if hasattr(event, 'get_group_id') else 'default'
-        self.group_monitor_enabled[group_id] = True
-        
-        # 显式保存该群的 monitor_enabled
-        try:
-            path = self._get_group_data_path(group_id, "monitor_enabled")
-            with open(path, "w", encoding="utf-8") as f:
-                json.dump(True, f, ensure_ascii=False)
-        except Exception as e:
-            logger.warning(f"保存 group_monitor_enabled 失败: {e} (group_id={group_id})")
-
-        self._save_persistent_data()  # 立即保存状态
         if not self.API_KEY:
             yield event.plain_result("未配置 Steam API Key，请先在插件配置中填写 steam_api_key。")
             return
@@ -971,6 +1394,8 @@ class SteamStatusMonitorV2(Star):
         if group_id in self.running_groups:
             yield event.plain_result("本群Steam监控已在运行。")
             return
+
+        self.group_monitor_enabled[group_id] = True
         self.running_groups.add(group_id)
         if not hasattr(self, 'notify_sessions'):
             self.notify_sessions = {}
@@ -986,13 +1411,14 @@ class SteamStatusMonitorV2(Star):
             status = await self.fetch_player_status(sid)
             if status:
                 self.group_last_states[group_id][sid] = status
-                if status.get('gameid'):
-                    prev = self.group_last_states[group_id].get(sid)
-                    prev_gameid = prev.get('gameid') if prev else None
-                    if prev_gameid and prev_gameid == status.get('gameid') and sid in self.group_start_play_times[group_id]:
-                        pass
-                    else:
-                        self.group_start_play_times[group_id][sid] = int(time.time())
+                sid_start_times = self.group_start_play_times[group_id].get(sid)
+                if not isinstance(sid_start_times, dict):
+                    sid_start_times = {}
+                    self.group_start_play_times[group_id][sid] = sid_start_times
+                current_gameid = status.get('gameid')
+                if current_gameid not in [None, "", "0"]:
+                    sid_start_times.setdefault(str(current_gameid), now)
+        self._save_persistent_data()  # 立即保存状态
         yield event.plain_result("本群Steam状态监控启动完成喔！ヾ(≧ω≦)ゞ")
 
     @filter.command("steam addid")
@@ -1070,6 +1496,86 @@ class SteamStatusMonitorV2(Star):
             msg += f"本群监控组人数已达上限（{limit}人），部分ID未添加。\n"
         yield event.plain_result(msg.strip() if msg else "未添加任何SteamID。")
 
+    def _cancel_task_if_possible(self, task):
+        if task and hasattr(task, "cancel"):
+            task.cancel()
+
+    def _get_group_sid_pending_quit_tasks(self, group_id, steamid):
+        pending_quit_tasks = getattr(self, "_pending_quit_tasks", None)
+        if not isinstance(pending_quit_tasks, dict):
+            pending_quit_tasks = {}
+            self._pending_quit_tasks = pending_quit_tasks
+        group_tasks = pending_quit_tasks.get(group_id)
+        if not isinstance(group_tasks, dict):
+            group_tasks = {}
+            pending_quit_tasks[group_id] = group_tasks
+        sid_tasks = group_tasks.get(steamid)
+        if not isinstance(sid_tasks, dict):
+            sid_tasks = {}
+            group_tasks[steamid] = sid_tasks
+        return sid_tasks
+
+    def _cancel_pending_quit_tasks_for_sid(self, group_id, steamid):
+        pending_quit_tasks = getattr(self, "_pending_quit_tasks", {})
+        if not isinstance(pending_quit_tasks, dict):
+            return
+        group_tasks = pending_quit_tasks.get(group_id, {})
+        sid_tasks = group_tasks.pop(steamid, {}) if isinstance(group_tasks, dict) else {}
+        if isinstance(sid_tasks, dict):
+            for task in sid_tasks.values():
+                self._cancel_task_if_possible(task)
+        if isinstance(group_tasks, dict) and not group_tasks:
+            pending_quit_tasks.pop(group_id, None)
+
+        # 兼容旧结构：_pending_quit_tasks[sid][gameid]
+        legacy_sid_tasks = pending_quit_tasks.pop(steamid, None)
+        if isinstance(legacy_sid_tasks, dict):
+            for task in legacy_sid_tasks.values():
+                self._cancel_task_if_possible(task)
+
+    def _clear_group_sid_state(self, group_id, steamid):
+        group_scoped_maps = [
+            self.group_last_states,
+            self.group_start_play_times,
+            self.group_last_quit_times,
+            self.group_pending_logs,
+            self.group_pending_quit,
+        ]
+        for storage in group_scoped_maps:
+            group_bucket = storage.get(group_id)
+            if isinstance(group_bucket, dict):
+                group_bucket.pop(steamid, None)
+
+        next_poll_bucket = self.next_poll_time.get(group_id, {})
+        if isinstance(next_poll_bucket, dict):
+            next_poll_bucket.pop(steamid, None)
+
+        for key in list(getattr(self, "_recent_start_notify", {}).keys()):
+            if isinstance(key, tuple) and len(key) >= 2 and key[0] == group_id and key[1] == steamid:
+                self._recent_start_notify.pop(key, None)
+
+    def _cancel_group_sid_achievement_tasks(self, group_id, steamid):
+        cleared_games = set()
+        achievement_monitor = getattr(self, "achievement_monitor", None)
+        for key in list(self.achievement_poll_tasks.keys()):
+            if key[0] != group_id or key[1] != steamid:
+                continue
+            poll_task = self.achievement_poll_tasks.pop(key, None)
+            self._cancel_task_if_possible(poll_task)
+            self.achievement_snapshots.pop(key, None)
+            cleared_games.add(key[2])
+            if achievement_monitor:
+                achievement_monitor.clear_game_achievements(group_id, steamid, key[2])
+
+        for key in list(self.achievement_snapshots.keys()):
+            if key[0] != group_id or key[1] != steamid:
+                continue
+            self.achievement_snapshots.pop(key, None)
+            if key[2] in cleared_games:
+                continue
+            if achievement_monitor:
+                achievement_monitor.clear_game_achievements(group_id, steamid, key[2])
+
     @filter.command("steam delid")
     async def steam_delid(self, event: AstrMessageEvent, steamid: str):
         '''从本群监控组删除SteamID（分群）'''
@@ -1083,9 +1589,13 @@ class SteamStatusMonitorV2(Star):
         
         if group_id in self.group_steam_qq and steamid in self.group_steam_qq[group_id]:
             del self.group_steam_qq[group_id][steamid]
-            self._save_persistent_data()
+
+        self._cancel_pending_quit_tasks_for_sid(group_id, steamid)
+        self._cancel_group_sid_achievement_tasks(group_id, steamid)
+        self._clear_group_sid_state(group_id, steamid)
             
         self._save_group_steam_ids()  # 新增：保存到 steam_groups.json
+        self._save_persistent_data()
         yield event.plain_result(f"已为本群删除SteamID: {steamid}")
 
     @filter.command("steam bind")
@@ -1214,7 +1724,18 @@ class SteamStatusMonitorV2(Star):
             yield event.plain_result(f"无效参数: {key}")
             return
         old = self.config[key]
-        if isinstance(old, int):
+        if isinstance(old, bool):
+            normalized = value.strip().lower()
+            truthy = {"1", "true", "yes", "on", "y"}
+            falsy = {"0", "false", "no", "off", "n"}
+            if normalized in truthy:
+                value = True
+            elif normalized in falsy:
+                value = False
+            else:
+                yield event.plain_result("类型错误，应为布尔值")
+                return
+        elif isinstance(old, int):
             try:
                 value = int(value)
             except Exception:
@@ -1228,9 +1749,6 @@ class SteamStatusMonitorV2(Star):
                 return
         elif isinstance(old, list):
             value = [x.strip() for x in value.split(",") if x.strip()]
-        elif isinstance(old, bool):
-            v = value.strip().lower()
-            value = v in {"1", "true", "yes", "on", "y"}
         self.config[key] = value
         # 同步到属性
         self.API_KEY = self.config.get('steam_api_key', '')
@@ -1243,26 +1761,67 @@ class SteamStatusMonitorV2(Star):
             self.achievement_monitor.enable_failure_blacklist = self.enable_failure_blacklist
         if hasattr(self.config, "save_config"):
             self.config.save_config()
-        yield event.plain_result(f"已设置 {key} = {value}")
+        hidden_keys = {"steam_api_key", "sgdb_api_key"}
+        display_value = "******" if key in hidden_keys else value
+        yield event.plain_result(f"已设置 {key} = {display_value}")
 
     @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("steam rs")
     async def steam_rs(self, event: AstrMessageEvent):
         '''清除所有状态并初始化（重启插件用）'''
+        flush_task_store = getattr(self, "group_notification_flush_tasks", {})
+        flush_tasks = [
+            task
+            for task in flush_task_store.values()
+            if hasattr(task, "done") and not task.done()
+        ]
+        await self._cancel_asyncio_tasks(flush_tasks)
+        if hasattr(self, "group_notification_flush_tasks"):
+            self.group_notification_flush_tasks.clear()
+        if hasattr(self, "group_notification_flush_states"):
+            self.group_notification_flush_states.clear()
+        if hasattr(self, "group_notification_window_started_at"):
+            self.group_notification_window_started_at.clear()
+        if hasattr(self, "group_notification_buffers"):
+            self.group_notification_buffers.clear()
+
+        achievement_tasks = [
+            task
+            for task in self.achievement_poll_tasks.values()
+            if hasattr(task, "done") and not task.done()
+        ]
+        await self._cancel_asyncio_tasks(achievement_tasks)
+        self.achievement_poll_tasks.clear()
+        self.achievement_snapshots.clear()
+
+        pending_quit_tasks = self._collect_pending_quit_tasks()
+        for task in pending_quit_tasks:
+            task.cancel()
+        pending_quit_asyncio = [task for task in pending_quit_tasks if hasattr(task, "done")]
+        if pending_quit_asyncio:
+            await asyncio.gather(*pending_quit_asyncio, return_exceptions=True)
+        self._pending_quit_tasks = {}
+
         self.group_last_states.clear()
         self.group_start_play_times.clear()
         self.group_last_quit_times.clear()
         self.group_pending_logs.clear()
         self.group_pending_quit.clear()
         self.group_recent_games.clear()
-        self._superpower_cache.clear()
-        self._game_name_cache.clear()
-        self.achievement_poll_tasks.clear()
-        self.achievement_snapshots.clear()
+        if hasattr(self, "next_poll_time"):
+            self.next_poll_time.clear()
+        if hasattr(self, "_recent_start_notify"):
+            self._recent_start_notify.clear()
+        if hasattr(self, "_superpower_cache"):
+            self._superpower_cache.clear()
+        if hasattr(self, "_game_name_cache"):
+            self._game_name_cache.clear()
         self.running_groups.clear()
-        self.group_monitor_enabled.clear()
-        self.group_achievement_enabled.clear()
+        for group_id in self.group_steam_ids.keys():
+            self.group_monitor_enabled[group_id] = False
+            self.group_achievement_enabled[group_id] = False
         self.notify_sessions = {}
+        self._save_notify_session()
         self._save_persistent_data()  # 清空后保存
         yield event.plain_result("Steam状态监控插件已重置，所有状态已清空。")
 
@@ -1320,6 +1879,7 @@ class SteamStatusMonitorV2(Star):
     async def steam_achievement_on(self, event: AstrMessageEvent):
         group_id = str(event.get_group_id()) if hasattr(event, 'get_group_id') else 'default'
         self.group_achievement_enabled[group_id] = True
+        self._save_persistent_data()
         yield event.plain_result(f"已为本群开启Steam成就推送。")
 
     @filter.permission_type(filter.PermissionType.ADMIN)
@@ -1327,6 +1887,7 @@ class SteamStatusMonitorV2(Star):
     async def steam_achievement_off(self, event: AstrMessageEvent):
         group_id = str(event.get_group_id()) if hasattr(event, 'get_group_id') else 'default'
         self.group_achievement_enabled[group_id] = False
+        self._save_persistent_data()
         yield event.plain_result(f"已为本群关闭Steam成就推送。")
 
     @filter.permission_type(filter.PermissionType.ADMIN)
@@ -1529,45 +2090,25 @@ class SteamStatusMonitorV2(Star):
             logger.info(f"[Debug Quit] Processing quit: info_name={info.get('name')}, info_image_name={info.get('image_name')}, final_render_name={render_name}")
 
             msg = f"👋 {info['name']} 不玩 {info['game_name']}了\n游玩时间 {time_str}"
-            notify_session = getattr(self, 'notify_sessions', {}).get(group_id, None)
-            if notify_session:
+            image_path = None
+            if self._get_notify_session(group_id):
                 try:
-                    from datetime import datetime
-                    end_time_str = datetime.fromtimestamp(info["quit_time"]).strftime("%Y-%m-%d %H:%M")
-                    duration_h = info["duration_min"] / 60 if info["duration_min"] > 0 else 0
-                    avatar_url = None
-                    last_state = self.group_last_states.get(group_id, {}).get(sid)
-                    if last_state:
-                        avatar_url = last_state.get("avatarfull") or last_state.get("avatar")
-                    if not avatar_url:
-                        status_full = await self.fetch_player_status(sid)
-                        if status_full:
-                            avatar_url = status_full.get("avatarfull") or status_full.get("avatar")
-                    tip_text = info.get("tip_text") or "你已经和椅子合为一体，成为传说中的‘椅子精’了喵！"
-                    zh_game_name, en_game_name = await self.get_game_names(gameid, info["game_name"])
-                    print(f"[get_game_names] zh_game_name={zh_game_name}, en_game_name={en_game_name}")
-                    font_path = self.get_font_path('NotoSansHans-Regular.otf')
-                    # 优先使用 image_name (仅名片) 渲染图片
-                    render_name = info.get("image_name")
-                    if not render_name:
-                        # 兼容旧数据或fallback：尝试去除自动追加的后缀 " (SteamName)"
-                        raw = info.get("name", "")
-                        if " (" in raw and raw.endswith(")"):
-                            render_name = raw.rsplit(" (", 1)[0]
-                        else:
-                            render_name = raw
-                    img_bytes = await render_game_end(
-                        self.data_dir, sid, render_name, avatar_url, gameid, zh_game_name,
-                        end_time_str, tip_text, duration_h, sgdb_api_key=self.SGDB_API_KEY, font_path=font_path, sgdb_game_name=en_game_name, appid=gameid
+                    image_path = await self._render_game_end_notification_image(
+                        group_id, sid, gameid, info
                     )
-                    import tempfile
-                    with tempfile.NamedTemporaryFile(delete=False, suffix=".png") as tmp:
-                        tmp.write(img_bytes)
-                        tmp_path = tmp.name
-                    await self.context.send_message(notify_session, MessageChain([Plain(msg), Image.fromFileSystem(tmp_path)]))
                 except Exception as e:
                     logger.error(f"推送游戏结束图片失败: {e}")
-                    await self.context.send_message(notify_session, MessageChain([Plain(msg)]))
+            event = self._create_group_notification_event(
+                event_type="game_end",
+                group_id=group_id,
+                steamid=sid,
+                player_name=info["name"],
+                gameid=gameid,
+                game_name=info["game_name"],
+                summary_text=msg,
+                image_path=image_path,
+            )
+            await self._enqueue_group_notification(event)
             # 三分钟后再关闭成就轮询和清理快照
             key = (group_id, sid, gameid)
             poll_task = self.achievement_poll_tasks.pop(key, None)
@@ -1591,6 +2132,7 @@ class SteamStatusMonitorV2(Star):
         recent_games = self.group_recent_games.setdefault(group_id, [])
         notify_session = getattr(self, 'notify_sessions', {}).get(group_id, None)
         msg_lines = []
+        manual_notifications = [] if is_manual else None
         for sid in steam_ids:
             status = status_override if status_override and sid == single_sid else await self.fetch_player_status(sid)
             if not status:
@@ -1659,16 +2201,13 @@ class SteamStatusMonitorV2(Star):
                 except Exception as e:
                     logger.error(f"结算成就时异常: {e}")
                 # 启动延迟任务
-                if not hasattr(self, '_pending_quit_tasks'):
-                    self._pending_quit_tasks = {}
-                if sid not in self._pending_quit_tasks:
-                    self._pending_quit_tasks[sid] = {}
+                sid_pending_quit_tasks = self._get_group_sid_pending_quit_tasks(group_id, sid)
                 # 取消旧任务
-                old_task = self._pending_quit_tasks[sid].get(prev_gameid)
+                old_task = sid_pending_quit_tasks.get(prev_gameid)
                 if old_task:
                     old_task.cancel()
                 task = asyncio.create_task(self._delayed_quit_check(group_id, sid, prev_gameid))
-                self._pending_quit_tasks[sid][prev_gameid] = task
+                sid_pending_quit_tasks[prev_gameid] = task
                 # 不移除 start_play_times[sid][prev_gameid]，保证时长累计
                 if sid not in last_quit_times:
                     last_quit_times[sid] = {}
@@ -1689,21 +2228,20 @@ class SteamStatusMonitorV2(Star):
                     pending_quit[sid] = {}
                 quit_info = pending_quit[sid].get(current_gameid)
                 # 检查是否为网络波动（3分钟内重启同一游戏）
-                if quit_info and now - quit_info["quit_time"] <= 180 and not quit_info.get("notified"):
-                    # 取消延迟任务
-                    if hasattr(self, '_pending_quit_tasks') and self._pending_quit_tasks.get(sid, {}).get(
-                            current_gameid):
-                        self._pending_quit_tasks[sid][current_gameid].cancel()
-                        self._pending_quit_tasks[sid].pop(current_gameid, None)
-                    quit_info["notified"] = True
-                    msg = f"⚠️ {name} 游玩 {zh_game_name} 时网络波动了"
-                    msg_chain = [Plain(msg)]
-                    notify_session = getattr(self, 'notify_sessions', {}).get(group_id, None)
-                    if notify_session:
-                        await self.context.send_message(notify_session, MessageChain(msg_chain))
+                pending_quit_tasks = getattr(self, '_pending_quit_tasks', {})
+                if await handle_recent_reconnect(
+                    group_id=group_id,
+                    sid=sid,
+                    current_gameid=current_gameid,
+                    now=now,
+                    quit_info=quit_info,
+                    pending_quit_tasks=pending_quit_tasks,
+                    pending_quit=pending_quit,
+                    last_states=last_states,
+                    status=status,
+                ):
                     # 保持原 start_play_times[sid][current_gameid]，不重置时长
-                    last_states[sid] = status
-                    continue  # 只推送网络波动提醒，跳过后续逻辑
+                    continue  # 网络波动重连不额外推送，跳过后续逻辑
                 # 修复：补充开始游戏推送逻辑
                 # 确保 start_play_times[sid] 是一个字典而不是 int 或其他类型
                 if not isinstance(start_play_times.get(sid), dict):
@@ -1711,30 +2249,32 @@ class SteamStatusMonitorV2(Star):
                 start_play_times[sid][current_gameid] = now
                 msg = f"🟢【{name}】开始游玩 {zh_game_name}"
                 notify_session = getattr(self, 'notify_sessions', {}).get(group_id, None)
+                image_path = None
                 if notify_session:
                     try:
-                        avatar_url = status.get("avatarfull") or status.get("avatar")
-                        superpower = self.get_today_superpower(sid)
-                        font_path = self.get_font_path('NotoSansHans-Regular.otf')
-                        online_count = await self.get_game_online_count(current_gameid)
-                        # 获取英文名用于 sgdb_game_name
-                        zh_game_name, en_game_name = await self.get_game_names(current_gameid, zh_game_name)
-                        # 优先使用 image_name (仅名片) 渲染图片
-                        render_name = image_name if image_name else name
-                        img_bytes = await render_game_start(
-                            self.data_dir, sid, render_name, avatar_url, current_gameid, zh_game_name,
-                            api_key=self.API_KEY, superpower=superpower, sgdb_api_key=self.SGDB_API_KEY,
-                            font_path=font_path, sgdb_game_name=en_game_name, online_count=online_count, appid=gameid
+                        image_path = await self._render_game_start_notification_image(
+                            sid,
+                            current_gameid,
+                            zh_game_name,
+                            image_name if image_name else name,
+                            status,
                         )
-                        import tempfile
-                        with tempfile.NamedTemporaryFile(delete=False, suffix=".png") as tmp:
-                            tmp.write(img_bytes)
-                            tmp_path = tmp.name
-                        await self.context.send_message(notify_session,
-                                                        MessageChain([Plain(msg), Image.fromFileSystem(tmp_path)]))
                     except Exception as e:
                         logger.error(f"推送开始游戏图片失败: {e}")
-                        await self.context.send_message(notify_session, MessageChain([Plain(msg)]))
+                event = self._create_group_notification_event(
+                    event_type="game_start",
+                    group_id=group_id,
+                    steamid=sid,
+                    player_name=name,
+                    gameid=current_gameid,
+                    game_name=zh_game_name,
+                    summary_text=msg,
+                    image_path=image_path,
+                )
+                if is_manual:
+                    manual_notifications.append(event)
+                else:
+                    await self._enqueue_group_notification(event)
                 # 成就监控任务启动
                 try:
                     player_name = name
@@ -1834,64 +2374,57 @@ class SteamStatusMonitorV2(Star):
                         time_str = f"{duration_min/60:.1f}小时"
                     msg = f"👋 {info['name']} 不玩 {info['game_name']}了\n游玩时间 {time_str}"
                     try:
+                        if duration_min < 5:
+                            info["tip_text"] = "风扇都没转热，主人就结束了？"
+                        elif duration_min < 10:
+                            info["tip_text"] = "杂鱼杂鱼~主人你就这水平？"
+                        elif duration_min < 30:
+                            info["tip_text"] = "热身一下就结束了？"
+                        elif duration_min < 60:
+                            info["tip_text"] = "歇会儿再来，别太累了喵！"
+                        elif duration_min < 120:
+                            info["tip_text"] = "沉浸在游戏世界，时间过得飞快喵！"
+                        elif duration_min < 300:
+                            info["tip_text"] = "肝到手软了喵！主人不如陪陪咱~"
+                        elif duration_min < 600:
+                            info["tip_text"] = "你吃饭了吗？还是说你已经忘了吃饭这件事？"
+                        elif duration_min < 1200:
+                            info["tip_text"] = "家里电费都要被你玩光了喵！"
+                        elif duration_min < 1800:
+                            info["tip_text"] = "咱都要给你颁发‘不眠猫’勋章了！"
+                        elif duration_min < 2400:
+                            info["tip_text"] = "主人你还活着喵？你是不是忘了关电脑呀~"
+                        else:
+                            info["tip_text"] = "你已经和椅子合为一体，成为传说中的‘椅子精’了喵！"
+                        image_path = None
                         if notify_session:
-                            # 新增：渲染游戏结束图片
                             try:
-                                from datetime import datetime
-                                end_time_str = datetime.fromtimestamp(info["quit_time"]).strftime("%Y-%m-%d %H:%M")
-                                avatar_url = None
-                                last_state = last_states.get(sid)
-                                if last_state:
-                                    avatar_url = last_state.get("avatarfull") or last_state.get("avatar")
-                                if not avatar_url:
-                                    status_full = await self.fetch_player_status(sid)
-                                    if status_full:
-                                        avatar_url = status_full.get("avatarfull") or status_full.get("avatar")
-                                # 获取友好提示词
-                                if duration_min < 5:
-                                    tip_text = "风扇都没转热，主人就结束了？"
-                                elif duration_min < 10:
-                                    tip_text = "杂鱼杂鱼~主人你就这水平？"
-                                elif duration_min < 30:
-                                    tip_text = "热身一下就结束了？"
-                                elif duration_min < 60:
-                                    tip_text = "歇会儿再来，别太累了喵！"
-                                elif duration_min < 120:
-                                    tip_text = "沉浸在游戏世界，时间过得飞快喵！"
-                                elif duration_min < 300:
-                                    tip_text = "肝到手软了喵！主人不如陪陪咱~"
-                                elif duration_min < 600:
-                                    tip_text = "你吃饭了吗？还是说你已经忘了吃饭这件事？"
-                                elif duration_min < 1200:
-                                    tip_text = "家里电费都要被你玩光了喵！"
-                                elif duration_min < 1800:
-                                    tip_text = "咱都要给你颁发‘不眠猫’勋章了！"
-                                elif duration_min < 2400:
-                                    tip_text = "主人你还活着喵？你是不是忘了关电脑呀~"
-                                else:
-                                    tip_text = "你已经和椅子合为一体，成为传说中的‘椅子精’了喵！"
-                                zh_game_name, en_game_name = await self.get_game_names(gameid, info["game_name"])
-                                print(f"[get_game_names] zh_game_name={zh_game_name}, en_game_name={en_game_name}")
-                                font_path = self.get_font_path('NotoSansHans-Regular.otf')
-                                img_bytes = await render_game_end(
-                                    self.data_dir, sid, info["name"], avatar_url, gameid, zh_game_name,
-                                    end_time_str, tip_text, duration_min/60 if duration_min > 0 else 0, sgdb_api_key=self.SGDB_API_KEY, font_path=font_path, sgdb_game_name=en_game_name, appid=gameid
+                                image_path = await self._render_game_end_notification_image(
+                                    group_id, sid, gameid, info
                                 )
-                                import tempfile
-                                with tempfile.NamedTemporaryFile(delete=False, suffix=".png") as tmp:
-                                    tmp.write(img_bytes)
-                                    tmp_path = tmp.name
-                                await self.context.send_message(notify_session, MessageChain([Plain(msg), Image.fromFileSystem(tmp_path)]))
                             except Exception as e:
                                 logger.error(f"推送游戏结束图片失败: {e}")
-                                await self.context.send_message(notify_session, MessageChain([Plain(msg)]))
+                        event = self._create_group_notification_event(
+                            event_type="game_end",
+                            group_id=group_id,
+                            steamid=sid,
+                            player_name=info["name"],
+                            gameid=gameid,
+                            game_name=info["game_name"],
+                            summary_text=msg,
+                            image_path=image_path,
+                        )
+                        if is_manual:
+                            manual_notifications.append(event)
                         else:
-                            logger.error("未设置推送会话，无法发送消息")
+                            await self._enqueue_group_notification(event)
                     except Exception as e:
                         logger.error(f"推送正常退出消息失败: {e}")
                     if gameid in pending_quit[sid]:
                         del pending_quit[sid][gameid]
 
+        if manual_notifications:
+            await self._flush_group_notifications_now(group_id, manual_notifications)
         self._save_persistent_data()
         # 只返回日志字符串
         return "\n".join(msg_lines) if msg_lines else None

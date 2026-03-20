@@ -185,7 +185,8 @@ async def render_steam_list_image(data_dir, user_list, font_path=None):
             card_draw.text((name_x, info_y), user['play_str'], font=font_small, fill=(255,120,120))
         img.alpha_composite(card, (left, top))
     # 统计
-    stat_str = f"在线: {sum(1 for u in user_list if u['status']=='online' or u['status']=='playing')} / 总数: {len(user_list)}"
+    online_status = {"online", "playing", "away", "busy", "snooze"}
+    stat_str = f"在线: {sum(1 for u in user_list if u['status'] in online_status)} / 总数: {len(user_list)}"
     draw.text((width-220, height-36), stat_str, font=font_small, fill=(180,220,255))
     # 输出
     img = img.convert("RGB")

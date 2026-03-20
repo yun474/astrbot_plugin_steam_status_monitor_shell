@@ -16,8 +16,6 @@ IMG_W, IMG_H = 512, 192
 # 星星素材路径（假定与本文件同目录）
 STAR_BG_PATH = os.path.join(os.path.dirname(__file__), "随机散布的小星星767x809xp.png")
 
-SGDB_API_KEY = "00c703ea9a664ce236526aca0faeaaf4"
-
 async def get_sgdb_vertical_cover(game_name, sgdb_api_key=None, sgdb_game_name=None, appid=None):
     import httpx
     if not sgdb_api_key:
@@ -66,29 +64,25 @@ async def get_sgdb_vertical_cover(game_name, sgdb_api_key=None, sgdb_game_name=N
             print(f"[get_sgdb_vertical_cover] SGDB API异常: {e}")
             return None
 
-def get_avatar_path(data_dir, steamid, url, force_update=False):
+async def get_avatar_path(data_dir, steamid, url, force_update=False):
     avatar_dir = os.path.join(data_dir, "avatars")
     os.makedirs(avatar_dir, exist_ok=True)
     path = os.path.join(avatar_dir, f"{steamid}.jpg")
     refresh_interval = 24 * 3600
-    print(f"[game_end_render] get_avatar_path: url={url}, path={path}, exists={os.path.exists(path)}")
     if os.path.exists(path) and not force_update:
         if time.time() - os.path.getmtime(path) < refresh_interval:
-            print(f"[game_end_render] 使用本地头像: {path}, size={os.path.getsize(path)}")
             return path
+    if not url:
+        return path if os.path.exists(path) else None
     try:
-        import httpx
-        resp = httpx.get(url, timeout=10)
-        if resp.status_code == 200:
-            with open(path, "wb") as f:
-                f.write(resp.content)
-            print(f"[game_end_render] 下载头像成功: {path}, size={os.path.getsize(path)}")
-            return path
-        else:
-            print(f"[game_end_render] 头像下载失败: HTTP {resp.status_code} url={url}")
-    except Exception as e:
-        import traceback
-        print(f"[game_end_render] 头像下载异常: {e}\n{traceback.format_exc()}")
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.get(url)
+            if resp.status_code == 200:
+                with open(path, "wb") as f:
+                    f.write(resp.content)
+                return path
+    except Exception:
+        pass
     return path if os.path.exists(path) else None
 
 # 渐变背景函数补充
@@ -107,8 +101,6 @@ def render_gradient_bg(img_w, img_h, color_top, color_bottom):
 
 # get_cover_path 改为 async def 并 await get_sgdb_vertical_cover
 async def get_cover_path(data_dir, gameid, game_name, force_update=False, sgdb_api_key=None, sgdb_game_name=None, appid=None):
-    from PIL import Image as PILImage
-    import httpx
     cover_dir = os.path.join(data_dir, "covers_v")
     os.makedirs(cover_dir, exist_ok=True)
     path = os.path.join(cover_dir, f"{gameid}.jpg")
@@ -119,11 +111,12 @@ async def get_cover_path(data_dir, gameid, game_name, force_update=False, sgdb_a
     url = await get_sgdb_vertical_cover(game_name, sgdb_api_key, sgdb_game_name=sgdb_game_name, appid=appid)
     if url:
         try:
-            resp = httpx.get(url, timeout=10)
-            if resp.status_code == 200:
-                with open(path, "wb") as f:
-                    f.write(resp.content)
-                return path
+            async with httpx.AsyncClient(timeout=10) as client:
+                resp = await client.get(url)
+                if resp.status_code == 200:
+                    with open(path, "wb") as f:
+                        f.write(resp.content)
+                    return path
         except Exception as e:
             print(f"[get_cover_path] SGDB下载异常: {e} url={url}")
     print(f"[get_cover_path] SGDB未收录或下载失败: {gameid} {game_name}")
@@ -373,7 +366,7 @@ async def render_game_end(data_dir, steamid, player_name, avatar_url, gameid, ga
     if " (" in player_name and player_name.endswith(")"):
         player_name = player_name.rsplit(" (", 1)[0]
         
-    avatar_path = get_avatar_path(data_dir, steamid, avatar_url)
+    avatar_path = await get_avatar_path(data_dir, steamid, avatar_url)
     cover_path = await get_cover_path(data_dir, gameid, game_name, sgdb_api_key=sgdb_api_key, sgdb_game_name=sgdb_game_name, appid=appid)
     img = render_game_end_image(player_name, avatar_path, game_name, cover_path, end_time_str, tip_text, duration_h, font_path=font_path)
     buf = io.BytesIO()

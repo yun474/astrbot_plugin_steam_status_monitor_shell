@@ -1,2 +1,5 @@
 httpx
 apscheduler
+aiohttp
+requests
+Pillow
