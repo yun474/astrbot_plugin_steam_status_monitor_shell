@@ -384,7 +384,7 @@ class SteamStatusMonitorV2(Star):
         card = self.group_member_cards.get(str(group_id), {}).get(qq_id)
         return {
             "qq": qq_id,
-            "name": card or qq_id,
+            "name": card or "",
             "avatar_url": self._build_qq_avatar_url(qq_id),
         }
 

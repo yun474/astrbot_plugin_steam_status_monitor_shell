@@ -409,7 +409,6 @@ def render_game_start_image(
                 avatar_size=40,
                 avatar_radius=10,
                 nick_fill=(255, 255, 255, 235),
-                qq_fill=(180, 220, 255, 170),
                 placeholder_fill=(70, 100, 110, 230),
                 stroke_width=1,
                 stroke_fill=(0, 0, 0, 180),

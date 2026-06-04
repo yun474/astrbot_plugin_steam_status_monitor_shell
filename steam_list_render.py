@@ -222,7 +222,6 @@ async def render_steam_list_image(data_dir, user_list, font_path=None):
                 avatar_size=MEMBER_AVATAR_SIZE,
                 avatar_radius=12,
                 nick_fill=(235, 245, 255, 235),
-                qq_fill=(165, 195, 220, 180),
                 placeholder_fill=(64, 82, 110, 230),
             )
         img.alpha_composite(card, (left, top))

@@ -68,7 +68,6 @@ def draw_member_profile(
     avatar_size=44,
     avatar_radius=12,
     nick_fill=(255, 255, 255, 235),
-    qq_fill=(180, 210, 235, 180),
     placeholder_fill=(70, 90, 120, 220),
     stroke_width=0,
     stroke_fill=None,
@@ -87,7 +86,7 @@ def draw_member_profile(
             radius=avatar_radius,
             fill=placeholder_fill,
         )
-        initial = str(member_profile.get("name") or member_profile.get("qq") or "?")[:1]
+        initial = str(member_profile.get("name") or "?")[:1]
         _draw_centered_text(
             draw,
             avatar_x,
@@ -100,10 +99,7 @@ def draw_member_profile(
             stroke_fill=stroke_fill,
         )
 
-    nick = fit_text(draw, member_profile.get("name") or member_profile.get("qq"), font_name, w)
-    qq = str(member_profile.get("qq") or "")
-    qq_text = fit_text(draw, f"QQ {qq}" if qq else "", font_small, w)
-
+    nick = fit_text(draw, member_profile.get("name"), font_name, w)
     nick_y = avatar_y + avatar_size + 6
     _draw_centered_text(
         draw,
@@ -116,15 +112,3 @@ def draw_member_profile(
         stroke_width=stroke_width,
         stroke_fill=stroke_fill,
     )
-    if nick_y + 18 < y + h:
-        _draw_centered_text(
-            draw,
-            x,
-            nick_y + 18,
-            w,
-            qq_text,
-            font_small,
-            qq_fill,
-            stroke_width=stroke_width,
-            stroke_fill=stroke_fill,
-        )
