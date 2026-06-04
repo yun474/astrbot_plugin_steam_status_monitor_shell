@@ -33,6 +33,10 @@ async def handle_steam_list(self, event, *, font_path: Optional[str] = None, **_
     results = await asyncio.gather(*tasks)
     
     for idx, sid in enumerate(steam_ids):
+        member_profile = None
+        get_member_profile = getattr(self, "get_group_member_profile", None)
+        if callable(get_member_profile):
+            member_profile = get_member_profile(group_id, sid)
         status = results[idx]
         if not status:
             user_list.append({
@@ -40,6 +44,7 @@ async def handle_steam_list(self, event, *, font_path: Optional[str] = None, **_
                 'name': self.get_group_card_name(group_id, sid, sid),
                 'status': 'error',
                 'avatar_url': '',
+                'member_profile': member_profile,
                 'game': '',
                 'gameid': '',
                 'play_str': '获取失败',
@@ -77,6 +82,7 @@ async def handle_steam_list(self, event, *, font_path: Optional[str] = None, **_
                 'name': name,
                 'status': 'playing',
                 'avatar_url': avatar_url,
+                'member_profile': member_profile,
                 'game': zh_game_name,
                 'gameid': gameid,
                 'play_str': play_str,
@@ -89,6 +95,7 @@ async def handle_steam_list(self, event, *, font_path: Optional[str] = None, **_
                 'name': name,
                 'status': status_name,
                 'avatar_url': avatar_url,
+                'member_profile': member_profile,
                 'game': '',
                 'gameid': '',
                 'play_str': '',
@@ -101,6 +108,7 @@ async def handle_steam_list(self, event, *, font_path: Optional[str] = None, **_
                 'name': name,
                 'status': 'offline',
                 'avatar_url': avatar_url,
+                'member_profile': member_profile,
                 'game': '',
                 'gameid': '',
                 'play_str': f"上次在线 {hours_ago:.1f} 小时前",
@@ -112,6 +120,7 @@ async def handle_steam_list(self, event, *, font_path: Optional[str] = None, **_
                 'name': name,
                 'status': 'offline',
                 'avatar_url': avatar_url,
+                'member_profile': member_profile,
                 'game': '',
                 'gameid': '',
                 'play_str': '',

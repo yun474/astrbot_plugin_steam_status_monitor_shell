@@ -5,6 +5,7 @@ import time
 import asyncio
 import httpx
 from PIL import Image, ImageDraw, ImageFont, ImageFilter
+from .member_profile_render import draw_member_profile
 
 # 更深的蓝紫色到黑色渐变
 BG_COLOR_TOP = (24, 18, 48)   # 顶部深蓝紫
@@ -211,7 +212,18 @@ def text_wrap(text, font, max_width):
         lines.append(line)
     return lines
 
-def render_game_end_image(player_name, avatar_path, game_name, cover_path, end_time_str, tip_text, duration_h, font_path=None):
+def render_game_end_image(
+    player_name,
+    avatar_path,
+    game_name,
+    cover_path,
+    end_time_str,
+    tip_text,
+    duration_h,
+    font_path=None,
+    member_profile=None,
+    member_avatar_path=None,
+):
     # 字体
     fonts_dir = os.path.join(os.path.dirname(__file__), 'fonts')
     font_regular = os.path.join(fonts_dir, 'NotoSansHans-Regular.otf')
@@ -306,10 +318,12 @@ def render_game_end_image(player_name, avatar_path, game_name, cover_path, end_t
     time_y = 6
     draw.text((time_x, time_y), time_str, font=font_time, fill=(255,255,255,220), stroke_width=2, stroke_fill=(0,0,0,255))
 
+    member_reserved_w = 108 if member_profile else 0
+
     # 4. 玩家名，顶部居左，自适应字号防止出界
     title_text = f"{player_name} 结束游戏"
     # 计算最大宽度（头像右侧到画布右侧，留24px边距）
-    max_title_w = IMG_W - (avatar_x + AVATAR_SIZE + 20) - 24
+    max_title_w = max(80, IMG_W - (avatar_x + AVATAR_SIZE + 20) - 24 - member_reserved_w)
     title_font_size = 28
     for size in range(28, 15, -2):
         try:
@@ -328,7 +342,7 @@ def render_game_end_image(player_name, avatar_path, game_name, cover_path, end_t
 
     # 5. 游戏名，头像右侧居左，第二行，自动换行
     game_name_y = 16 + font_title.size + 8
-    max_game_name_w = IMG_W - (avatar_x + AVATAR_SIZE + 20) - 24
+    max_game_name_w = max(80, IMG_W - (avatar_x + AVATAR_SIZE + 20) - 24 - member_reserved_w)
     game_name_lines = text_wrap(game_name, font_game, max_game_name_w)
     max_lines = 2
     for idx, line in enumerate(game_name_lines[:max_lines]):
@@ -358,17 +372,78 @@ def render_game_end_image(player_name, avatar_path, game_name, cover_path, end_t
     # 8. 友好提示词，玩家名列底部，且与进度条有间隔
     tip_y = bar_y - font_tip.size - 8
     draw.text((bar_x, tip_y), tip_text, font=font_tip, fill=(200,180,255,200), stroke_width=1, stroke_fill=(0,0,0,255))
+    if member_profile:
+        try:
+            member_avatar = None
+            if member_avatar_path and os.path.exists(member_avatar_path):
+                member_avatar = Image.open(member_avatar_path).convert("RGBA")
+            try:
+                font_member = ImageFont.truetype(font_regular, 13)
+                font_member_small = ImageFont.truetype(font_regular, 10)
+            except Exception:
+                font_member = font_member_small = ImageFont.load_default()
+            draw_member_profile(
+                img,
+                draw,
+                member_profile,
+                member_avatar,
+                (IMG_W - 18 - 92, 32, 92, 82),
+                font_member,
+                font_member_small,
+                avatar_size=40,
+                avatar_radius=10,
+                nick_fill=(255, 245, 255, 235),
+                qq_fill=(205, 185, 255, 170),
+                placeholder_fill=(70, 62, 110, 230),
+                stroke_width=1,
+                stroke_fill=(0, 0, 0, 200),
+            )
+        except Exception as e:
+            print(f"[game_end_render] 群头像/昵称渲染失败: {e}")
     return img.convert("RGB")
 
 # render_game_end 里 await get_cover_path
-async def render_game_end(data_dir, steamid, player_name, avatar_url, gameid, game_name, end_time_str, tip_text, duration_h, sgdb_api_key=None, font_path=None, sgdb_game_name=None, appid=None):
+async def render_game_end(
+    data_dir,
+    steamid,
+    player_name,
+    avatar_url,
+    gameid,
+    game_name,
+    end_time_str,
+    tip_text,
+    duration_h,
+    sgdb_api_key=None,
+    font_path=None,
+    sgdb_game_name=None,
+    appid=None,
+    member_profile=None,
+):
     # 强制修正名称：如果包含 (Steam昵称) 后缀，则去除
     if " (" in player_name and player_name.endswith(")"):
         player_name = player_name.rsplit(" (", 1)[0]
         
     avatar_path = await get_avatar_path(data_dir, steamid, avatar_url)
     cover_path = await get_cover_path(data_dir, gameid, game_name, sgdb_api_key=sgdb_api_key, sgdb_game_name=sgdb_game_name, appid=appid)
-    img = render_game_end_image(player_name, avatar_path, game_name, cover_path, end_time_str, tip_text, duration_h, font_path=font_path)
+    member_avatar_path = None
+    if member_profile and member_profile.get("avatar_url") and member_profile.get("qq"):
+        member_avatar_path = await get_avatar_path(
+            data_dir,
+            f"qq_{member_profile['qq']}",
+            member_profile["avatar_url"],
+        )
+    img = render_game_end_image(
+        player_name,
+        avatar_path,
+        game_name,
+        cover_path,
+        end_time_str,
+        tip_text,
+        duration_h,
+        font_path=font_path,
+        member_profile=member_profile,
+        member_avatar_path=member_avatar_path,
+    )
     buf = io.BytesIO()
     img.save(buf, format="PNG")
     buf.seek(0)

@@ -368,6 +368,26 @@ class SteamStatusMonitorV2(Star):
                 return card
         return default_name or steam_id
 
+    def _build_qq_avatar_url(self, qq_id):
+        qq_id = str(qq_id or "").strip()
+        if not qq_id or not qq_id.isdigit():
+            return ""
+        return f"https://q1.qlogo.cn/g?b=qq&nk={qq_id}&s=100"
+
+    def get_group_member_profile(self, group_id, steam_id):
+        """获取绑定 QQ 的群内展示信息，用于列表图和推送图补充展示。"""
+        qq_map = self.group_steam_qq.get(str(group_id), {})
+        qq_id = qq_map.get(str(steam_id))
+        if not qq_id:
+            return None
+        qq_id = str(qq_id)
+        card = self.group_member_cards.get(str(group_id), {}).get(qq_id)
+        return {
+            "qq": qq_id,
+            "name": card or qq_id,
+            "avatar_url": self._build_qq_avatar_url(qq_id),
+        }
+
     async def update_group_cards_loop(self):
         """每天定时更新群名片"""
         while True:
@@ -980,7 +1000,7 @@ class SteamStatusMonitorV2(Star):
         return self._write_temp_image(img_bytes)
 
     async def _render_game_start_notification_image(
-        self, sid, current_gameid, zh_game_name, render_name, status
+        self, group_id, sid, current_gameid, zh_game_name, render_name, status
     ):
         avatar_url = status.get("avatarfull") or status.get("avatar")
         zh_game_name, en_game_name = await self.get_game_names(
@@ -1000,6 +1020,7 @@ class SteamStatusMonitorV2(Star):
             sgdb_game_name=en_game_name,
             online_count=await self.get_game_online_count(current_gameid),
             appid=current_gameid,
+            member_profile=self.get_group_member_profile(group_id, sid),
         )
         return self._write_temp_image(img_bytes)
 
@@ -1032,6 +1053,7 @@ class SteamStatusMonitorV2(Star):
             font_path=self.get_font_path('NotoSansHans-Regular.otf'),
             sgdb_game_name=en_game_name,
             appid=gameid,
+            member_profile=self.get_group_member_profile(group_id, sid),
         )
         return self._write_temp_image(img_bytes)
 
@@ -2254,6 +2276,7 @@ class SteamStatusMonitorV2(Star):
                 if notify_session:
                     try:
                         image_path = await self._render_game_start_notification_image(
+                            group_id,
                             sid,
                             current_gameid,
                             zh_game_name,

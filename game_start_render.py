@@ -4,6 +4,7 @@ import time
 import httpx
 from PIL import Image, ImageDraw, ImageFont
 import random
+from .member_profile_render import draw_member_profile
 
 BG_COLOR_TOP = (49, 80, 66)
 BG_COLOR_BOTTOM = (28, 35, 44)
@@ -227,7 +228,18 @@ def get_font_path(font_name):
         return font_path2
     return font_name
 
-def render_game_start_image(player_name, avatar_path, game_name, cover_path, playtime_hours=None, superpower=None, online_count=None, font_path=None):
+def render_game_start_image(
+    player_name,
+    avatar_path,
+    game_name,
+    cover_path,
+    playtime_hours=None,
+    superpower=None,
+    online_count=None,
+    font_path=None,
+    member_profile=None,
+    member_avatar_path=None,
+):
     # 字体
     fonts_dir = os.path.join(os.path.dirname(__file__), 'fonts')
     font_regular = os.path.join(fonts_dir, 'NotoSansHans-Regular.otf')
@@ -271,8 +283,9 @@ def render_game_start_image(player_name, avatar_path, game_name, cover_path, pla
     # avatar_y 的赋值和渲染放到后面
 
     # 3. 文本：头像右侧，整体垂直居中，左右留白，无背景
+    member_reserved_w = 108 if member_profile else 0
     text_x = avatar_x + avatar_size + avatar_margin
-    text_area_w = img_w - text_x - avatar_margin
+    text_area_w = max(90, img_w - text_x - avatar_margin - member_reserved_w)
     game_name_padded = pad_game_name(game_name, min_cn_len=10)
     game_name_lines = text_wrap(game_name_padded, font, text_area_w)
     line_height = 36
@@ -337,7 +350,10 @@ def render_game_start_image(player_name, avatar_path, game_name, cover_path, pla
         online_text_w = text_bbox[2] - text_bbox[0] + 10  # 加右侧边距
 
     # 玩家名自适应字号，防止出界和与在线人数重叠
-    max_playername_w = IMG_W - (text_x + 8) - online_text_w - 24
+    max_playername_w = max(
+        80,
+        IMG_W - (text_x + 8) - online_text_w - 24 - member_reserved_w,
+    )
     player_font_size = 28
     for size in range(28, 15, -2):
         try:
@@ -372,15 +388,77 @@ def render_game_start_image(player_name, avatar_path, game_name, cover_path, pla
     if online_text:
         draw.text((IMG_W - online_text_w, 10), online_text, font=font_online, fill=(120,180,255,180))
 
+    if member_profile:
+        try:
+            member_avatar = None
+            if member_avatar_path and os.path.exists(member_avatar_path):
+                member_avatar = Image.open(member_avatar_path).convert("RGBA")
+            try:
+                font_member = ImageFont.truetype(font_medium, 13)
+                font_member_small = ImageFont.truetype(font_regular, 10)
+            except Exception:
+                font_member = font_member_small = ImageFont.load_default()
+            draw_member_profile(
+                img,
+                draw,
+                member_profile,
+                member_avatar,
+                (IMG_W - avatar_margin - 92, (IMG_H - 82) // 2, 92, 82),
+                font_member,
+                font_member_small,
+                avatar_size=40,
+                avatar_radius=10,
+                nick_fill=(255, 255, 255, 235),
+                qq_fill=(180, 220, 255, 170),
+                placeholder_fill=(70, 100, 110, 230),
+                stroke_width=1,
+                stroke_fill=(0, 0, 0, 180),
+            )
+        except Exception as e:
+            print(f"[render_game_start_image] 群头像/昵称渲染失败: {e}")
+
     return img.convert("RGB")
 
-async def render_game_start(data_dir, steamid, player_name, avatar_url, gameid, game_name, api_key=None, superpower=None, online_count=None, sgdb_api_key=None, font_path=None, sgdb_game_name=None, appid=None):
+async def render_game_start(
+    data_dir,
+    steamid,
+    player_name,
+    avatar_url,
+    gameid,
+    game_name,
+    api_key=None,
+    superpower=None,
+    online_count=None,
+    sgdb_api_key=None,
+    font_path=None,
+    sgdb_game_name=None,
+    appid=None,
+    member_profile=None,
+):
     avatar_path = await get_avatar_path(data_dir, steamid, avatar_url)
     cover_path = await get_cover_path(data_dir, gameid, game_name, sgdb_api_key=sgdb_api_key, sgdb_game_name=sgdb_game_name, appid=appid)
     playtime_hours = None
     if api_key:
         playtime_hours = await get_playtime_hours(api_key, steamid, gameid)
-    img = render_game_start_image(player_name, avatar_path, game_name, cover_path, playtime_hours, superpower, online_count, font_path=font_path)
+    member_avatar_path = None
+    if member_profile and member_profile.get("avatar_url") and member_profile.get("qq"):
+        member_avatar_path = await get_avatar_path(
+            data_dir,
+            f"qq_{member_profile['qq']}",
+            member_profile["avatar_url"],
+        )
+    img = render_game_start_image(
+        player_name,
+        avatar_path,
+        game_name,
+        cover_path,
+        playtime_hours,
+        superpower,
+        online_count,
+        font_path=font_path,
+        member_profile=member_profile,
+        member_avatar_path=member_avatar_path,
+    )
     buf = io.BytesIO()
     img.save(buf, format="PNG")
     buf.seek(0)

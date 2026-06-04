@@ -5,6 +5,7 @@ import httpx
 from PIL import Image, ImageDraw, ImageFont
 import asyncio
 import logging
+from .member_profile_render import draw_member_profile, fit_text
 
 logger = logging.getLogger(__name__)
 
@@ -17,6 +18,8 @@ AVATAR_RADIUS = 12
 CARD_HEIGHT = 110
 CARD_MARGIN = 18
 CARD_GAP = 12
+MEMBER_PANEL_W = 118
+MEMBER_AVATAR_SIZE = 42
 FONT_PATH_BOLD = "msyhbd.ttc"
 FONT_PATH = "msyh.ttc"
 
@@ -41,6 +44,16 @@ async def fetch_avatar(avatar_url, data_dir, sid):
     except Exception:
         pass
     return None
+
+
+async def fetch_member_avatar(member_profile, data_dir):
+    if not member_profile:
+        return None
+    avatar_url = member_profile.get("avatar_url")
+    qq = member_profile.get("qq")
+    if not avatar_url or not qq:
+        return None
+    return await fetch_avatar(avatar_url, data_dir, f"qq_{qq}")
 
 def get_status_color(status):
     if status == 'playing':
@@ -138,14 +151,19 @@ async def render_steam_list_image(data_dir, user_list, font_path=None):
     draw.text(((width-title_bbox[2]+title_bbox[0])//2, 12), title, font=font_title, fill=(255,255,255))
     # 卡片
     tasks = [fetch_avatar(u['avatar_url'], data_dir, u['sid']) for u in user_list]
-    avatars = await asyncio.gather(*tasks)
+    member_tasks = [fetch_member_avatar(u.get('member_profile'), data_dir) for u in user_list]
+    avatars, member_avatars = await asyncio.gather(
+        asyncio.gather(*tasks),
+        asyncio.gather(*member_tasks),
+    )
     for idx, user in enumerate(user_list):
         top = CARD_MARGIN + idx * (CARD_HEIGHT + CARD_GAP) + 50
         left = CARD_MARGIN
         # 卡片底
-        card = Image.new('RGBA', (width-2*CARD_MARGIN, CARD_HEIGHT), (0,0,0,0))
+        card_w = width - 2 * CARD_MARGIN
+        card = Image.new('RGBA', (card_w, CARD_HEIGHT), (0,0,0,0))
         card_draw = ImageDraw.Draw(card)
-        card_draw.rounded_rectangle((0,0,width-2*CARD_MARGIN,CARD_HEIGHT), radius=CARD_RADIUS, fill=CARD_BG)
+        card_draw.rounded_rectangle((0,0,card_w,CARD_HEIGHT), radius=CARD_RADIUS, fill=CARD_BG)
         # 头像（正方形+小圆角）
         avatar = avatars[idx]
         if avatar:
@@ -156,20 +174,29 @@ async def render_steam_list_image(data_dir, user_list, font_path=None):
         # 顺序：玩家名（游戏时浅绿色），在线状态/游戏名（深绿色），上次在线/已游玩时间
         name_x = 18+AVATAR_SIZE+18
         name_y = 18
+        member_profile = user.get('member_profile')
+        if member_profile:
+            member_x = card_w - MEMBER_PANEL_W - 12
+            text_max_w = max(80, member_x - name_x - 12)
+        else:
+            member_x = None
+            text_max_w = max(80, card_w - name_x - 18)
         # 玩家名颜色
         if user['status'] == 'playing':
             name_color = (227,255,194)
         else:
             name_color = get_name_color(user['status'])
-        card_draw.text((name_x, name_y), user['name'], font=font_name, fill=name_color)
+        card_draw.text((name_x, name_y), fit_text(card_draw, user['name'], font_name, text_max_w), font=font_name, fill=name_color)
         # 在线状态/游戏名
         status_y = name_y + 28
         if user['status'] == 'playing':
             # 游戏名深绿色
-            card_draw.text((name_x, status_y), f"正在玩：{user['game']}", font=font_game, fill=(131,175,80))
+            game_text = fit_text(card_draw, f"正在玩：{user['game']}", font_game, text_max_w)
+            card_draw.text((name_x, status_y), game_text, font=font_game, fill=(131,175,80))
             # 已游玩时间
             info_y = status_y + 26
-            card_draw.text((name_x, info_y), f"时长：{user['play_str']}", font=font_small, fill=(180,220,180))
+            play_text = fit_text(card_draw, f"时长：{user['play_str']}", font_small, text_max_w)
+            card_draw.text((name_x, info_y), play_text, font=font_small, fill=(180,220,180))
         elif user['status'] in ('online', 'away', 'snooze', 'busy'):
             # 其它在线状态
             card_draw.text((name_x, status_y), get_status_text(user['status']), font=font_game, fill=get_status_color(user['status']))
@@ -178,11 +205,26 @@ async def render_steam_list_image(data_dir, user_list, font_path=None):
             # 离线状态白色
             card_draw.text((name_x, status_y), "离线", font=font_game, fill=(255,255,255))
             info_y = status_y + 26
-            card_draw.text((name_x, info_y), user['play_str'], font=font_small, fill=(180,180,180))
+            card_draw.text((name_x, info_y), fit_text(card_draw, user['play_str'], font_small, text_max_w), font=font_small, fill=(180,180,180))
         elif user['status'] == 'error':
             card_draw.text((name_x, status_y), "异常", font=font_game, fill=(255,120,120))
             info_y = status_y + 26
             card_draw.text((name_x, info_y), user['play_str'], font=font_small, fill=(255,120,120))
+        if member_profile:
+            draw_member_profile(
+                card,
+                card_draw,
+                member_profile,
+                member_avatars[idx],
+                (member_x, 14, MEMBER_PANEL_W, CARD_HEIGHT - 24),
+                font_status,
+                font_small,
+                avatar_size=MEMBER_AVATAR_SIZE,
+                avatar_radius=12,
+                nick_fill=(235, 245, 255, 235),
+                qq_fill=(165, 195, 220, 180),
+                placeholder_fill=(64, 82, 110, 230),
+            )
         img.alpha_composite(card, (left, top))
     # 统计
     online_status = {"online", "playing", "away", "busy", "snooze"}
