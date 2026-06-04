@@ -55,8 +55,9 @@
 - `/steam alllist` 列出所有群聊分组及玩家状态
 - `/steam config` 查看当前插件配置
 - `/steam set [参数] [值]` 设置配置参数（如 `/steam set fixed_poll_interval 600`）
-- `/steam addid [SteamID] [QQ号]` 添加监控，可绑定QQ号以显示群名片（如 `/steam addid 76561198xxxxxxxxx 123456789`）
+- `/steam addid [SteamID] [QQ号]` 添加监控，可绑定QQ号以显示群名片；不填QQ号时默认绑定发送命令的人（如 `/steam addid 76561198xxxxxxxxx`）
 - `/steam bind [SteamID] [QQ号]` 为已添加的SteamID绑定或更新QQ号
+- `/steam refresh_card [SteamID]` 主动刷新本群绑定QQ的群名片缓存，不填 SteamID 时刷新本群全部绑定
 - `/steam delid [SteamID]` 从本群监控列表删除SteamID
 - `/steam openbox [SteamID]` 查看指定SteamID的全部详细信息
 - `/steam rs` 清除所有状态并初始化（可能不生效）
@@ -118,6 +119,6 @@ pip install httpx apscheduler aiohttp requests pillow
 
 ## 🐔 联系作者
 
-- **反馈**：欢迎在 [GitHub Issues](https://github.com/1592363624/astrbot_plugin_zanwo_shell/issues) 提交问题或建议
+- **反馈**：欢迎在 [GitHub Issues](https://github.com/yun474/astrbot_plugin_steam_status_monitor_shell/issues) 提交问题或建议
 QQ群:91219736
 telegram:[巅峰阁](https://t.me/ShellDFG)

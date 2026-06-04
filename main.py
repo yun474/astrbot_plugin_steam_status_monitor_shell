@@ -14,6 +14,7 @@ import random
 from .openbox import handle_openbox  # 新增导入
 from .steam_list import handle_steam_list  # 新增导入
 import re
+import inspect
 from .achievement_monitor import AchievementMonitor
 from .game_start_render import render_game_start  # 新增导入
 from .game_end_render import render_game_end  # 新增导入
@@ -36,8 +37,8 @@ from .superpower_util import load_abilities, get_daily_superpower  # 新增导�
     "steam_status_monitor_shell",
     "Shell",
     "Steam状态监控插件",
-    "2.2.6",
-    "https://github.com/Gezhe14/astrbot_plugin_steam_status_monitor_shell"
+    "2.2.8",
+    "https://github.com/yun474/astrbot_plugin_steam_status_monitor_shell"
 )
 class SteamStatusMonitorV2(Star):
     def _get_group_data_path(self, group_id, key):
@@ -388,6 +389,212 @@ class SteamStatusMonitorV2(Star):
             "avatar_url": self._build_qq_avatar_url(qq_id),
         }
 
+    def _normalize_platform_id(self, value):
+        value = str(value).strip()
+        return int(value) if value.isdigit() else value
+
+    def _pick_user_id_from_sender(self, sender):
+        if not sender:
+            return None
+        if isinstance(sender, dict):
+            value = (
+                sender.get('user_id')
+                or sender.get('sender_id')
+                or sender.get('id')
+                or sender.get('qq')
+            )
+        else:
+            value = (
+                getattr(sender, 'user_id', None)
+                or getattr(sender, 'sender_id', None)
+                or getattr(sender, 'id', None)
+                or getattr(sender, 'qq', None)
+            )
+        if value:
+            value = str(value).strip()
+            return value if value else None
+        return None
+
+    def _get_event_sender_id(self, event):
+        for method_name in ('get_sender_id', 'get_user_id'):
+            method = getattr(event, method_name, None)
+            if callable(method):
+                try:
+                    value = method()
+                    if value:
+                        return str(value).strip()
+                except Exception:
+                    pass
+
+        sender_method = getattr(event, 'get_sender', None)
+        if callable(sender_method):
+            try:
+                value = self._pick_user_id_from_sender(sender_method())
+                if value:
+                    return value
+            except Exception:
+                pass
+
+        for attr_name in ('sender_id', 'user_id'):
+            value = getattr(event, attr_name, None)
+            if value:
+                return str(value).strip()
+
+        value = self._pick_user_id_from_sender(getattr(event, 'sender', None))
+        if value:
+            return value
+
+        message_obj = getattr(event, 'message_obj', None)
+        if message_obj:
+            for attr_name in ('sender_id', 'user_id'):
+                value = getattr(message_obj, attr_name, None)
+                if value:
+                    return str(value).strip()
+            value = self._pick_user_id_from_sender(getattr(message_obj, 'sender', None))
+            if value:
+                return value
+        return None
+
+    async def _maybe_await(self, value):
+        if inspect.isawaitable(value):
+            return await value
+        return value
+
+    def _get_group_member_info_clients(self):
+        clients = []
+
+        def add_client(client):
+            if client and client not in clients:
+                clients.append(client)
+
+        add_client(self.context)
+        pm = getattr(self.context, 'platform_manager', None)
+        if pm:
+            if hasattr(pm, 'get_insts') and callable(pm.get_insts):
+                for inst in pm.get_insts():
+                    add_client(inst)
+            elif hasattr(pm, 'platform_insts'):
+                platform_insts = pm.platform_insts
+                if isinstance(platform_insts, list):
+                    for inst in platform_insts:
+                        add_client(inst)
+                elif isinstance(platform_insts, dict):
+                    for inst in platform_insts.values():
+                        add_client(inst)
+
+        adapter = getattr(self.context, 'adapter', None)
+        add_client(adapter)
+        add_client(getattr(adapter, 'bot', None))
+
+        capable_clients = []
+        for client in clients:
+            if hasattr(client, 'get_group_member_info') or hasattr(client, 'call_api'):
+                capable_clients.append(client)
+            bot = getattr(client, 'bot', None)
+            if bot and bot not in capable_clients and (
+                hasattr(bot, 'get_group_member_info') or hasattr(bot, 'call_api')
+            ):
+                capable_clients.append(bot)
+        return capable_clients
+
+    async def _call_group_member_info_client(self, client, group_id, qq_id):
+        group_arg = self._normalize_platform_id(group_id)
+        user_arg = self._normalize_platform_id(qq_id)
+
+        if hasattr(client, 'get_group_member_info'):
+            method = client.get_group_member_info
+            try:
+                return await self._maybe_await(method(
+                    group_id=group_arg,
+                    user_id=user_arg,
+                    no_cache=True,
+                ))
+            except TypeError:
+                try:
+                    return await self._maybe_await(method(group_arg, user_arg))
+                except TypeError:
+                    return await self._maybe_await(method(str(group_id), str(qq_id)))
+
+        if hasattr(client, 'call_api'):
+            try:
+                return await self._maybe_await(client.call_api(
+                    'get_group_member_info',
+                    group_id=group_arg,
+                    user_id=user_arg,
+                    no_cache=True,
+                ))
+            except TypeError:
+                return await self._maybe_await(client.call_api(
+                    'get_group_member_info',
+                    {
+                        'group_id': group_arg,
+                        'user_id': user_arg,
+                        'no_cache': True,
+                    },
+                ))
+        return None
+
+    def _extract_group_member_card_name(self, info):
+        if not info:
+            return None
+        data = info.get('data', info) if isinstance(info, dict) else info
+        if isinstance(data, dict):
+            return (
+                data.get('card')
+                or data.get('nickname')
+                or data.get('member_name')
+                or data.get('name')
+            )
+        return (
+            getattr(data, 'card', None)
+            or getattr(data, 'member_name', None)
+            or getattr(data, 'nickname', None)
+            or getattr(data, 'name', None)
+        )
+
+    async def _fetch_group_member_card_name(self, group_id, qq_id, *, clients=None, log_failures=False):
+        clients = clients if clients is not None else self._get_group_member_info_clients()
+        if not clients:
+            if log_failures:
+                logger.warning(f"[名片刷新] 找不到可用的群成员信息接口 group_id={group_id} qq={qq_id}")
+            return None
+
+        for client in clients:
+            try:
+                info = await self._call_group_member_info_client(client, group_id, qq_id)
+                name = self._extract_group_member_card_name(info)
+                if name:
+                    return str(name)
+                if log_failures and info:
+                    logger.warning(
+                        f"[名片刷新] 群成员信息中没有名片字段 group_id={group_id} qq={qq_id} "
+                        f"client={type(client).__name__}"
+                    )
+            except Exception as e:
+                if log_failures:
+                    logger.warning(
+                        f"[名片刷新] 获取群成员信息失败 group_id={group_id} qq={qq_id} "
+                        f"client={type(client).__name__}: {e}"
+                    )
+        return None
+
+    async def _refresh_group_member_card(self, group_id, steam_id, *, clients=None, log_failures=False):
+        group_id = str(group_id)
+        steam_id = str(steam_id)
+        qq_id = self.group_steam_qq.get(group_id, {}).get(steam_id)
+        if not qq_id:
+            return None
+        qq_id = str(qq_id)
+        name = await self._fetch_group_member_card_name(
+            group_id,
+            qq_id,
+            clients=clients,
+            log_failures=log_failures,
+        )
+        if name:
+            self.group_member_cards.setdefault(group_id, {})[qq_id] = name
+        return name
+
     async def update_group_cards_loop(self):
         """每天定时更新群名片"""
         while True:
@@ -397,38 +604,9 @@ class SteamStatusMonitorV2(Star):
                     await asyncio.sleep(86400)
                     continue
                 
-                # 寻找可用作 API 调用的 Bot/Platform 实例
-                bots = []
-                
-                # 1. 尝试从 platform_manager 获取
-                pm = getattr(self.context, 'platform_manager', None)
-                if pm:
-                    if hasattr(pm, 'get_insts') and callable(pm.get_insts):
-                        bots.extend(pm.get_insts())
-                    elif hasattr(pm, 'platform_insts'):
-                        pi = pm.platform_insts
-                        if isinstance(pi, list):
-                            bots.extend(pi)
-                        elif isinstance(pi, dict):
-                            bots.extend(pi.values())
-                
-                # 2. 尝试从 context.adapter 获取
-                adapter = getattr(self.context, 'adapter', None)
-                if adapter and adapter not in bots:
-                    bots.append(adapter)
-                    if hasattr(adapter, 'bot'):
-                        bots.append(adapter.bot)
-
-                # 筛选出有 get_group_member_info 方法或 call_api 方法的实例
-                capable_bots = []
-                for b in bots:
-                    if hasattr(b, 'get_group_member_info') or hasattr(b, 'call_api'):
-                        capable_bots.append(b)
-                    elif hasattr(b, 'bot') and (hasattr(b.bot, 'get_group_member_info') or hasattr(b.bot, 'call_api')):
-                        capable_bots.append(b.bot)
-                
+                capable_bots = self._get_group_member_info_clients()
                 if not capable_bots:
-                    # 避免刷屏，仅在第一次失败时提示或静默
+                    logger.warning("[名片更新] 找不到可用的群成员信息接口，本轮跳过")
                     await asyncio.sleep(86400)
                     continue
 
@@ -446,35 +624,19 @@ class SteamStatusMonitorV2(Star):
                         continue
                     # 复制该群的 {steamid: qq} 映射，防止遍历期间被修改
                     steam_qq_items = list(current_mapping.items())
-                    
+
                     for steam_id, qq_id in steam_qq_items:
-                        success = False
-                        for bot in capable_bots:
-                            try:
-                                info = None
-                                if hasattr(bot, 'get_group_member_info'):
-                                    info = await bot.get_group_member_info(group_id=group_id, user_id=qq_id, no_cache=True)
-                                elif hasattr(bot, 'call_api'):
-                                    info = await bot.call_api('get_group_member_info', group_id=group_id, user_id=qq_id, no_cache=True)
-                                
-                                if info:
-                                    data = info.get('data', info) if isinstance(info, dict) else info
-                                    name = None
-                                    if isinstance(data, dict):
-                                        name = data.get('card') or data.get('nickname') or data.get('member_name')
-                                    else:
-                                        name = getattr(data, 'card', None) or getattr(data, 'member_name', None) or getattr(data, 'nickname', None)
-                                    
-                                    if name:
-                                        self.group_member_cards.setdefault(group_id, {})[qq_id] = name
-                                        count += 1
-                                        success = True
-                                        break
-                            except Exception:
-                                pass
-                        
+                        name = await self._refresh_group_member_card(
+                            group_id,
+                            steam_id,
+                            clients=capable_bots,
+                            log_failures=False,
+                        )
+                        if name:
+                            count += 1
+
                         await asyncio.sleep(0.5)
-                        
+
                 if count > 0:
                     self._save_persistent_data()
                     logger.info(f"[名片更新] 本轮更新结束，已更新 {count} 个名片")
@@ -1446,12 +1608,13 @@ class SteamStatusMonitorV2(Star):
 
     @filter.command("steam addid")
     async def steam_addid(self, event: AstrMessageEvent, steamid: str, qq: str = None):
-        '''添加SteamID到本群监控列表，支持指定QQ号以显示群名片（/steam addid [steamid] [qq]），支持多个ID用点号分隔'''
+        '''添加SteamID到本群监控列表，未指定QQ时默认绑定发送者，支持多个ID用点号分隔'''
         steamid = str(steamid)
         if qq:
             qq = str(qq)
         group_id = str(event.get_group_id()) if hasattr(event, 'get_group_id') else 'default'
-        
+        default_qq = None if qq else self._get_event_sender_id(event)
+
         pairs = [] # (sid, qq_id)
         if qq:
             pairs.append((steamid.strip(), qq.strip()))
@@ -1462,7 +1625,7 @@ class SteamStatusMonitorV2(Star):
                     sid, q = item.split(':', 1)
                     pairs.append((sid.strip(), q.strip()))
                 else:
-                    pairs.append((item, None))
+                    pairs.append((item, default_qq))
         
         steamid_list = [p[0] for p in pairs]
         invalid_ids = [sid for sid in steamid_list if not sid.isdigit() or len(sid) != 17]
@@ -1502,18 +1665,26 @@ class SteamStatusMonitorV2(Star):
             msg += f"以下SteamID已存在于本群监控组: {'.'.join(already)}\n"
         if mapped_qq:
             msg += f"已更新 {len(mapped_qq)} 个账号的QQ映射。\n"
-            # 尝试立即更新名片
-            try:
-                for sid in mapped_qq:
-                    qqid = self.group_steam_qq[group_id][sid]
-                    info = await self.context.get_group_member_info(group_id, qqid)
-                    if info:
-                        name = info.card or info.nickname
-                        if name:
-                            self.group_member_cards.setdefault(group_id, {})[qqid] = name
+            if not qq and default_qq:
+                msg += f"未传入QQ号，已默认绑定发送者QQ：{default_qq}\n"
+            refreshed_names = []
+            clients = self._get_group_member_info_clients()
+            for sid in mapped_qq:
+                name = await self._refresh_group_member_card(
+                    group_id,
+                    sid,
+                    clients=clients,
+                    log_failures=True,
+                )
+                if name:
+                    refreshed_names.append(name)
+            if refreshed_names:
                 self._save_persistent_data()
-            except Exception:
-                pass
+                msg += f"已立即刷新 {len(refreshed_names)} 个群名片：{'、'.join(refreshed_names[:5])}\n"
+            else:
+                msg += "暂未获取到群名片，可稍后使用 /steam refresh_card 主动刷新。\n"
+        elif not qq and default_qq is None:
+            msg += "未传入QQ号，且未能识别发送者QQ，本次只添加SteamID未绑定QQ。\n"
 
         if len(steam_ids) >= limit and len(added) < len(steamid_list):
             msg += f"本群监控组人数已达上限（{limit}人），部分ID未添加。\n"
@@ -1632,61 +1803,76 @@ class SteamStatusMonitorV2(Star):
         if steamid not in steam_ids:
             yield event.plain_result(f"SteamID {steamid} 未在本群监控列表中，请先使用 /steam addid 添加。")
             return
-            
+
         self.group_steam_qq.setdefault(group_id, {})[steamid] = qq
         self._save_persistent_data()
-        
-        # 尝试立即更新名片
-        try:
-            # 复用 update_group_cards_loop 中的查找逻辑 (简化版)
-            # 或者直接让下一次 loop 更新。为了即时反馈，简单尝试一下。
-            bots = []
-            pm = getattr(self.context, 'platform_manager', None)
-            if pm:
-                if hasattr(pm, 'get_insts') and callable(pm.get_insts):
-                    bots.extend(pm.get_insts())
-                elif hasattr(pm, 'platform_insts'):
-                    pi = pm.platform_insts
-                    if isinstance(pi, list):
-                        bots.extend(pi)
-                    elif isinstance(pi, dict):
-                        bots.extend(pi.values())
-            adapter = getattr(self.context, 'adapter', None)
-            if adapter and adapter not in bots:
-                bots.append(adapter)
-                
-            capable_bots = []
-            for b in bots:
-                if hasattr(b, 'get_group_member_info') or hasattr(b, 'call_api'):
-                    capable_bots.append(b)
-                elif hasattr(b, 'bot') and (hasattr(b.bot, 'get_group_member_info') or hasattr(b.bot, 'call_api')):
-                    capable_bots.append(b.bot)
-            
-            for bot in capable_bots:
-                info = None
-                if hasattr(bot, 'get_group_member_info'):
-                    info = await bot.get_group_member_info(group_id=group_id, user_id=qq, no_cache=True)
-                elif hasattr(bot, 'call_api'):
-                    info = await bot.call_api('get_group_member_info', group_id=group_id, user_id=qq, no_cache=True)
-                
-                if info:
-                    data = info.get('data', info) if isinstance(info, dict) else info
-                    name = None
-                    if isinstance(data, dict):
-                        name = data.get('card') or data.get('nickname') or data.get('member_name')
-                    else:
-                        name = getattr(data, 'card', None) or getattr(data, 'member_name', None) or getattr(data, 'nickname', None)
-                    
-                    if name:
-                        self.group_member_cards.setdefault(group_id, {})[qq] = name
-                        self._save_persistent_data()
-                        yield event.plain_result(f"绑定成功！已获取名片：{name}")
-                        return
-        except Exception as e:
-            logger.warning(f"绑定时获取名片失败: {e}")
-            pass
-        
-        yield event.plain_result(f"已将 SteamID {steamid} 绑定到 QQ {qq} (名片将在下次自动更新时获取)。")
+
+        name = await self._refresh_group_member_card(
+            group_id,
+            steamid,
+            log_failures=True,
+        )
+        if name:
+            self._save_persistent_data()
+            yield event.plain_result(f"绑定成功！已获取名片：{name}")
+            return
+
+        yield event.plain_result(
+            f"已将 SteamID {steamid} 绑定到 QQ {qq}，但暂未获取到群名片。"
+            "可稍后使用 /steam refresh_card 主动刷新。"
+        )
+
+    @filter.command("steam refresh_card")
+    async def steam_refresh_card(self, event: AstrMessageEvent, steamid: str = None):
+        '''主动刷新本群绑定QQ的群名片缓存（/steam refresh_card [SteamID]）'''
+        group_id = str(event.get_group_id()) if hasattr(event, 'get_group_id') else 'default'
+        qq_map = self.group_steam_qq.get(group_id, {})
+        if not qq_map:
+            yield event.plain_result("本群还没有绑定QQ号，先用 /steam bind 或 /steam addid [SteamID] [QQ号]。")
+            return
+
+        if steamid:
+            steamid = str(steamid).strip()
+            if steamid not in qq_map:
+                yield event.plain_result(f"SteamID {steamid} 暂未绑定QQ号。")
+                return
+            steam_ids = [steamid]
+        else:
+            steam_ids = list(qq_map.keys())
+
+        clients = self._get_group_member_info_clients()
+        if not clients:
+            yield event.plain_result("没有找到可用的群成员信息接口，暂时无法主动刷新群名片。")
+            return
+
+        refreshed = []
+        failed = []
+        for sid in steam_ids:
+            qq_id = qq_map.get(sid)
+            name = await self._refresh_group_member_card(
+                group_id,
+                sid,
+                clients=clients,
+                log_failures=True,
+            )
+            if name:
+                refreshed.append((sid, name))
+            else:
+                failed.append((sid, qq_id))
+
+        if refreshed:
+            self._save_persistent_data()
+
+        lines = []
+        if refreshed:
+            preview = "、".join(f"{sid}: {name}" for sid, name in refreshed[:5])
+            lines.append(f"已刷新 {len(refreshed)} 个群名片：{preview}")
+        if failed:
+            preview = "、".join(f"{sid}(QQ {qq})" for sid, qq in failed[:5])
+            lines.append(f"{len(failed)} 个未获取到：{preview}")
+        if len(refreshed) > 5 or len(failed) > 5:
+            lines.append("结果较多，仅展示前5个。")
+        yield event.plain_result("\n".join(lines) if lines else "没有可刷新的群名片。")
 
     @filter.command("steam list")
     async def steam_list(self, event: AstrMessageEvent):
@@ -1859,8 +2045,9 @@ class SteamStatusMonitorV2(Star):
             "/steam check - 立即手动检测本群并推送变更\n"
             "/steam config - 查看当前配置\n"
             "/steam set [参数] [值] - 设置配置参数\n"
-            "/steam addid [SteamID] [QQ号] - 添加监控，可绑定QQ以显示名片\n"
+            "/steam addid [SteamID] [QQ号] - 添加监控，不填QQ时默认绑定发送者\n"
             "/steam bind [SteamID] [QQ号] - 为已添加的SteamID绑定QQ号\n"
+            "/steam refresh_card [SteamID] - 主动刷新本群绑定QQ的群名片缓存\n"
             "/steam delid [SteamID] - 删除SteamID\n"
             "/steam openbox [SteamID] - 查看指定SteamID的全部信息\n"
             "/steam rs - 清除状态并初始化\n"
