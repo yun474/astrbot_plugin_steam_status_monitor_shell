@@ -497,6 +497,124 @@ class SteamStatusMonitorV2(Star):
                 capable_clients.append(bot)
         return capable_clients
 
+    def _normalize_forward_sender_uin(self, value, warn=False):
+        value = str(value or '').strip()
+        if not value:
+            return ''
+        if value.isdigit():
+            return value
+        if warn:
+            logger.warning(f"notification_forward_sender_uin 不是纯数字，已忽略: {value}")
+        return ''
+
+    def _get_session_platform_id(self, session):
+        if not isinstance(session, str) or ':' not in session:
+            return None
+        return session.split(':', 1)[0]
+
+    def _extract_forward_sender_uin(self, source):
+        if source is None:
+            return None
+        if isinstance(source, (int, str)):
+            return self._normalize_forward_sender_uin(source)
+        if isinstance(source, dict):
+            for key in ('self_id', 'user_id', 'uin', 'qq', 'account'):
+                value = self._normalize_forward_sender_uin(source.get(key))
+                if value:
+                    return value
+            return None
+        for attr_name in ('self_id', 'user_id', 'uin', 'qq', 'account'):
+            value = self._normalize_forward_sender_uin(getattr(source, attr_name, None))
+            if value:
+                return value
+        return None
+
+    def _get_forward_sender_clients(self, notify_session=None):
+        target_platform_id = self._get_session_platform_id(notify_session)
+        clients = []
+
+        def add_client(client):
+            if client and client not in clients:
+                clients.append(client)
+
+        def add_platform_instance(inst):
+            if not inst:
+                return
+            platform_id = None
+            meta = getattr(inst, 'metadata', None)
+            meta_method = getattr(inst, 'meta', None)
+            if callable(meta_method):
+                try:
+                    meta = meta_method()
+                except Exception:
+                    pass
+            if meta:
+                platform_id = getattr(meta, 'id', None) or getattr(meta, 'name', None)
+            if target_platform_id and platform_id and platform_id != target_platform_id:
+                return
+            add_client(inst)
+            add_client(getattr(inst, 'bot', None))
+            add_client(getattr(inst, 'client', None))
+
+        pm = getattr(self.context, 'platform_manager', None)
+        if pm:
+            if hasattr(pm, 'get_insts') and callable(pm.get_insts):
+                for inst in pm.get_insts():
+                    add_platform_instance(inst)
+            elif hasattr(pm, 'platform_insts'):
+                platform_insts = pm.platform_insts
+                if isinstance(platform_insts, list):
+                    for inst in platform_insts:
+                        add_platform_instance(inst)
+                elif isinstance(platform_insts, dict):
+                    for inst in platform_insts.values():
+                        add_platform_instance(inst)
+
+        adapter = getattr(self.context, 'adapter', None)
+        add_platform_instance(adapter)
+        return clients
+
+    async def _call_get_login_info(self, client):
+        for method_name in ('get_login_info',):
+            method = getattr(client, method_name, None)
+            if not callable(method):
+                continue
+            try:
+                return await self._maybe_await(method())
+            except Exception as e:
+                logger.debug(f"获取 OneBot 登录信息失败: {e}")
+
+        for method_name in ('call_action', 'call_api'):
+            method = getattr(client, method_name, None)
+            if not callable(method):
+                continue
+            try:
+                return await self._maybe_await(method('get_login_info'))
+            except Exception as e:
+                logger.debug(f"通过 {method_name} 获取 OneBot 登录信息失败: {e}")
+        return None
+
+    async def _resolve_forward_sender_uin(self, notify_session=None):
+        if self.notification_forward_sender_uin:
+            return self.notification_forward_sender_uin
+        if self._notification_forward_sender_uin_cache:
+            return self._notification_forward_sender_uin_cache
+
+        clients = self._get_forward_sender_clients(notify_session)
+        for client in clients:
+            value = self._extract_forward_sender_uin(client)
+            if value:
+                self._notification_forward_sender_uin_cache = value
+                return value
+
+        for client in clients:
+            login_info = await self._call_get_login_info(client)
+            value = self._extract_forward_sender_uin(login_info)
+            if value:
+                self._notification_forward_sender_uin_cache = value
+                return value
+        return None
+
     async def _call_group_member_info_client(self, client, group_id, qq_id):
         group_arg = self._normalize_platform_id(group_id)
         user_arg = self._normalize_platform_id(qq_id)
@@ -719,6 +837,15 @@ class SteamStatusMonitorV2(Star):
             'auto',
             {'auto', 'forward', 'plain'},
         )
+        self.notification_forward_sender_uin = self._normalize_forward_sender_uin(
+            self.config.get('notification_forward_sender_uin', ''),
+            warn=True,
+        )
+        self.notification_forward_sender_name = (
+            str(self.config.get('notification_forward_sender_name', 'Steam 状态监控')).strip()
+            or 'Steam 状态监控'
+        )
+        self._notification_forward_sender_uin_cache = None
         self.notification_merge_achievements = self.config.get(
             'notification_merge_achievements', True
         )
@@ -1043,21 +1170,35 @@ class SteamStatusMonitorV2(Star):
         )
         delivery_succeeded = False
         try:
-            try:
-                if should_use_forward_delivery(
-                    self.notification_delivery_mode, notify_session
-                ):
-                    await self.context.send_message(
-                        notify_session,
-                        MessageChain([self.build_forward_nodes(folded_events)]),
-                    )
+            use_forward_delivery = should_use_forward_delivery(
+                self.notification_delivery_mode, notify_session
+            )
+            if use_forward_delivery:
+                sender_uin = await self._resolve_forward_sender_uin(notify_session)
+                if sender_uin:
+                    try:
+                        await self.context.send_message(
+                            notify_session,
+                            MessageChain([
+                                self.build_forward_nodes(folded_events, sender_uin)
+                            ]),
+                        )
+                    except Exception as e:
+                        logger.error(f"发送合并转发消息失败，回退普通聚合消息: {e}")
+                        await self.context.send_message(
+                            notify_session,
+                            self.build_fallback_chain(folded_events),
+                        )
                 else:
+                    logger.warning(
+                        "未能确定合并转发节点 QQ 号，已回退普通聚合消息。"
+                        "可配置 notification_forward_sender_uin 为机器人 QQ。"
+                    )
                     await self.context.send_message(
                         notify_session,
                         self.build_fallback_chain(folded_events),
                     )
-            except Exception as e:
-                logger.error(f"发送合并转发消息失败，回退普通聚合消息: {e}")
+            else:
                 await self.context.send_message(
                     notify_session,
                     self.build_fallback_chain(folded_events),
@@ -1070,14 +1211,18 @@ class SteamStatusMonitorV2(Star):
             if delivery_succeeded:
                 self._cleanup_notification_images(events)
 
-    def build_forward_nodes(self, events):
+    def build_forward_nodes(self, events, sender_uin):
         nodes = []
         for event in events:
             content = [Plain(event["summary_text"])]
             image_path = event.get("image_path")
             if image_path and os.path.exists(image_path):
                 content.append(Image.fromFileSystem(image_path))
-            nodes.append(Node(uin="0", name="Steam 状态监控", content=content))
+            nodes.append(Node(
+                uin=sender_uin,
+                name=self.notification_forward_sender_name,
+                content=content,
+            ))
         return Nodes(nodes)
 
     def build_fallback_chain(self, events):

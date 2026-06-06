@@ -64,6 +64,18 @@
     "hint": "仅支持 auto、forward、plain；非法值会回退到 auto",
     "default": "auto"
   },
+  "notification_forward_sender_uin": {
+    "description": "合并转发节点QQ号",
+    "type": "string",
+    "hint": "留空时自动识别机器人QQ；NapCat发送失败时建议填机器人QQ号",
+    "default": ""
+  },
+  "notification_forward_sender_name": {
+    "description": "合并转发节点昵称",
+    "type": "string",
+    "hint": "合并转发消息里显示的发送者昵称",
+    "default": "Steam 状态监控"
+  },
   "notification_merge_achievements": {
     "description": "成就通知合并开关",
     "type": "bool",

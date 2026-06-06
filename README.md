@@ -95,6 +95,8 @@ pip install httpx apscheduler aiohttp requests pillow
 - `notification_batch_window_sec`: 通知批处理窗口（秒），默认 `45`。
 - `notification_batch_max_events`: 通知批处理最大事件数，默认 `12`。
 - `notification_delivery_mode`: 通知投递模式，支持 `auto`/`forward`/`plain`。
+- `notification_forward_sender_uin`: 合并转发节点 QQ 号，留空时自动识别机器人 QQ。
+- `notification_forward_sender_name`: 合并转发节点昵称，默认 `Steam 状态监控`。
 - `notification_merge_achievements`: 成就通知合并开关，默认开启。
 
 可以添加QQ：1912584909 来反馈功能和建议 闲聊也欢迎喵~
